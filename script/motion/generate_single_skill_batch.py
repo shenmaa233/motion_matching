@@ -505,9 +505,10 @@ def _select_skill_entry_index(
     return int(ranked_indices[0])
 
 
-def _terrain_pose_from_fixed_skill(
-    clip: MotionClip,
-    source_frame: int,
+def _terrain_pose_from_root_qpos(
+    root_qpos: np.ndarray,
+    *,
+    mirrored: bool,
     terrain_root_offset: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     if not terrain_root_offset:
@@ -515,11 +516,23 @@ def _terrain_pose_from_fixed_skill(
 
     translation_local = np.asarray(terrain_root_offset.get("translation", [0.0, 0.0, 0.0]), dtype=np.float64).copy()
     yaw_deg = float(terrain_root_offset.get("yaw_deg", 0.0))
-    if clip.mirrored:
+    if mirrored:
         translation_local[1] *= -1.0
         yaw_deg *= -1.0
 
-    root_qpos = clip.qpos[source_frame]
+    return _terrain_pose_from_local_offset(
+        root_qpos,
+        translation_local=translation_local,
+        yaw_deg=yaw_deg,
+    )
+
+
+def _terrain_pose_from_local_offset(
+    root_qpos: np.ndarray,
+    *,
+    translation_local: np.ndarray,
+    yaw_deg: float,
+) -> dict[str, Any]:
     root_yaw = float(np.rad2deg(quaternion_to_yaw(root_qpos[:4])))
     yaw_rad = np.deg2rad(root_yaw)
     rotation = np.asarray(
@@ -540,6 +553,55 @@ def _terrain_pose_from_fixed_skill(
         "translation": [float(value) for value in terrain_translation.tolist()],
         "yaw_deg": terrain_yaw_deg,
     }
+
+
+def _terrain_pose_from_skill_asset_reference(
+    *,
+    current_root_qpos: np.ndarray,
+    skill_clip: MotionClip,
+    source_frame: int,
+    terrain_world_translation: np.ndarray | None = None,
+    terrain_world_yaw_deg: float = 0.0,
+) -> dict[str, Any] | None:
+    source_frame = int(np.clip(source_frame, 0, skill_clip.num_frames - 1))
+    reference_terrain_translation = np.asarray(
+        [0.0, 0.0, 0.0] if terrain_world_translation is None else terrain_world_translation,
+        dtype=np.float64,
+    )
+    source_root_qpos = np.asarray(skill_clip.qpos[source_frame], dtype=np.float64)
+    source_root_yaw_deg = float(np.rad2deg(quaternion_to_yaw(source_root_qpos[:4])))
+    inverse_source_yaw = np.deg2rad(-source_root_yaw_deg)
+    inverse_rotation = np.asarray(
+        (
+            (np.cos(inverse_source_yaw), -np.sin(inverse_source_yaw), 0.0),
+            (np.sin(inverse_source_yaw), np.cos(inverse_source_yaw), 0.0),
+            (0.0, 0.0, 1.0),
+        ),
+        dtype=np.float64,
+    )
+    translation_local = inverse_rotation @ (reference_terrain_translation - source_root_qpos[4:7])
+    yaw_deg = float(
+        np.rad2deg(
+            wrap_angle(np.deg2rad(float(terrain_world_yaw_deg) - source_root_yaw_deg))
+        )
+    )
+    return _terrain_pose_from_local_offset(
+        current_root_qpos,
+        translation_local=translation_local,
+        yaw_deg=yaw_deg,
+    )
+
+
+def _terrain_pose_from_fixed_skill(
+    clip: MotionClip,
+    source_frame: int,
+    terrain_root_offset: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    return _terrain_pose_from_root_qpos(
+        clip.qpos[source_frame],
+        mirrored=clip.mirrored,
+        terrain_root_offset=terrain_root_offset,
+    )
 
 
 def _generate_single_trajectory(
@@ -660,11 +722,6 @@ def _generate_single_trajectory(
     skill_frame = int(database.frame_indices[skill_database_index])
     skill_end_frame = int(skill_metadata["skill_end_frame"])
     skill_output_start = len(output_qpos)
-    terrain_world_pose = _terrain_pose_from_fixed_skill(
-        skill_clip,
-        skill_frame,
-        skill_metadata.get("terrain_root_offset"),
-    )
     skill_appended = _append_clip_chunk(
         output_qpos=output_qpos,
         clip=skill_clip,
@@ -681,6 +738,17 @@ def _generate_single_trajectory(
             num_output_frames=len(skill_appended),
             output_start_frame=skill_output_start,
         )
+    )
+    skill_output_source_frame = min(skill_frame + 1, skill_clip.num_frames - 1)
+    if len(skill_appended) > 0:
+        skill_anchor_qpos = np.asarray(output_qpos[skill_output_start], dtype=np.float64)
+    else:
+        skill_anchor_qpos = np.asarray(output_qpos[-1], dtype=np.float64)
+        skill_output_source_frame = int(skill_frame)
+    terrain_world_pose = _terrain_pose_from_skill_asset_reference(
+        current_root_qpos=skill_anchor_qpos,
+        skill_clip=skill_clip,
+        source_frame=skill_output_source_frame,
     )
 
     target_total_frames = len(output_qpos) + post_skill_frames
@@ -744,10 +812,15 @@ def _generate_single_trajectory(
         "skill_world_locked": False,
         "skill_anchor": {
             "fixed_world": False,
-            "source_frame": int(skill_frame),
+            "entry_source_frame": int(skill_frame),
+            "source_frame": int(skill_output_source_frame),
             "mirrored": bool(skill_clip.mirrored),
-            "root_translation": [float(value) for value in skill_clip.qpos[skill_frame, 4:7].tolist()],
-            "root_yaw_deg": float(np.rad2deg(quaternion_to_yaw(skill_clip.qpos[skill_frame, :4]))),
+            "root_translation": [float(value) for value in skill_clip.qpos[skill_output_source_frame, 4:7].tolist()],
+            "root_yaw_deg": float(np.rad2deg(quaternion_to_yaw(skill_clip.qpos[skill_output_source_frame, :4]))),
+        },
+        "terrain_anchor": {
+            "applied_source_frame": int(skill_output_source_frame),
+            "interpreted_as": "terrain_asset_origin_in_skill_clip_world",
         },
         "command": {
             "speed_mps": speed_mps,

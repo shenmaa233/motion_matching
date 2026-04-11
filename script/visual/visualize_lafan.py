@@ -15,6 +15,30 @@ DEFAULT_INPUT_DIR = "data/locomotion"
 DEFAULT_TERRAIN_MODEL_DIR = "data/models/terrain"
 
 
+def _rotate_xy(points_xy: np.ndarray, angle: float) -> np.ndarray:
+    cos_angle = float(np.cos(angle))
+    sin_angle = float(np.sin(angle))
+    rotation = np.asarray(
+        (
+            (cos_angle, -sin_angle),
+            (sin_angle, cos_angle),
+        ),
+        dtype=np.float64,
+    )
+    return np.asarray(points_xy, dtype=np.float64) @ rotation.T
+
+
+def _parse_origin_xyz_rpy(origin: ET.Element | None) -> tuple[np.ndarray, float]:
+    if origin is None:
+        return np.zeros(3, dtype=np.float64), 0.0
+
+    xyz_tokens = origin.attrib.get("xyz", "0 0 0").split()
+    rpy_tokens = origin.attrib.get("rpy", "0 0 0").split()
+    xyz = np.asarray([float(token) for token in xyz_tokens], dtype=np.float64)
+    yaw = float(rpy_tokens[2]) if len(rpy_tokens) >= 3 else 0.0
+    return xyz, yaw
+
+
 def create_plant(robot_model_path: str, object_model_path: str | list[str] | None = None):
     from pydrake.all import (
         AddMultibodyPlantSceneGraph,
@@ -177,10 +201,8 @@ def _write_transformed_terrain_urdf(terrain_urdf_path: str, terrain_world_pose: 
 
     source_path = Path(terrain_urdf_path).resolve()
     root = ET.parse(source_path).getroot()
-    translation = np.asarray(terrain_world_pose.get("translation", [0.0, 0.0, 0.0]), dtype=np.float64)
-    yaw_deg = float(terrain_world_pose.get("yaw_deg", 0.0))
-    rpy = f"0 0 {np.deg2rad(yaw_deg)}"
-    xyz = " ".join(str(float(value)) for value in translation.tolist())
+    global_translation = np.asarray(terrain_world_pose.get("translation", [0.0, 0.0, 0.0]), dtype=np.float64)
+    global_yaw = float(np.deg2rad(float(terrain_world_pose.get("yaw_deg", 0.0))))
 
     for mesh in root.findall(".//mesh"):
         filename = mesh.attrib.get("filename")
@@ -196,12 +218,42 @@ def _write_transformed_terrain_urdf(terrain_urdf_path: str, terrain_world_pose: 
         origin = joint.find("origin")
         if origin is None:
             origin = ET.SubElement(joint, "origin")
-        origin.attrib["xyz"] = xyz
-        origin.attrib["rpy"] = rpy
+        local_translation, local_yaw = _parse_origin_xyz_rpy(origin)
+        rotated_local_translation = local_translation.copy()
+        rotated_local_translation[:2] = _rotate_xy(local_translation[:2], global_yaw)
+        composed_translation = global_translation + rotated_local_translation
+        composed_yaw = global_yaw + local_yaw
+        origin.attrib["xyz"] = " ".join(str(float(value)) for value in composed_translation.tolist())
+        origin.attrib["rpy"] = f"0 0 {composed_yaw}"
 
     with tempfile.NamedTemporaryFile("w", suffix=".urdf", delete=False, encoding="utf-8") as handle:
         handle.write(ET.tostring(root, encoding="unicode"))
         return handle.name
+
+
+def _apply_visual_recenter(
+    q_knots: np.ndarray,
+    terrain_world_pose: dict | None,
+) -> tuple[np.ndarray, dict | None]:
+    recentered_q_knots = np.asarray(q_knots, dtype=np.float64).copy()
+    if recentered_q_knots.shape[0] == 0:
+        return recentered_q_knots, terrain_world_pose
+
+    if terrain_world_pose is not None:
+        terrain_translation = np.asarray(
+            terrain_world_pose.get("translation", [0.0, 0.0, 0.0]),
+            dtype=np.float64,
+        )
+        recentered_q_knots[:, 4:7] -= terrain_translation[None, :]
+
+        recentered_pose = dict(terrain_world_pose)
+        recentered_pose["translation"] = [0.0, 0.0, 0.0]
+        return recentered_q_knots, recentered_pose
+
+    xy_offset = recentered_q_knots[0, 4:6].copy()
+    recentered_q_knots[:, 4] -= xy_offset[0]
+    recentered_q_knots[:, 5] -= xy_offset[1]
+    return recentered_q_knots, None
 
 
 def visualize_lafan(
@@ -209,6 +261,7 @@ def visualize_lafan(
     filter: str = "",
     terrain: bool = False,
     terrain_model_dir: str = DEFAULT_TERRAIN_MODEL_DIR,
+    recenter: bool = True,
 ):
     lafan_files = find_files(base_path, filter=filter)
     generated_trajectory_index = _load_generated_trajectory_index(base_path)
@@ -224,12 +277,14 @@ def visualize_lafan(
             else:
                 terrain_model_path = _resolve_terrain_model_path(file_name, terrain_model_dir)
             terrain_world_pose = trajectory_manifest.get("terrain_world_pose")
-            if terrain_model_path is not None:
-                terrain_model_path = _write_transformed_terrain_urdf(terrain_model_path, terrain_world_pose)
-            plant, vis, diagram = create_plant(ROBOT_SPHERE_HAND_PATH, terrain_model_path)
             data = np.load(lafan_file, allow_pickle=True)
             fps = float(np.asarray(data["fps"]).reshape(-1)[0])
             q_knots = extract_q_knots(data)
+            if recenter:
+                q_knots, terrain_world_pose = _apply_visual_recenter(q_knots, terrain_world_pose)
+            if terrain_model_path is not None:
+                terrain_model_path = _write_transformed_terrain_urdf(terrain_model_path, terrain_world_pose)
+            plant, vis, diagram = create_plant(ROBOT_SPHERE_HAND_PATH, terrain_model_path)
             draw_q_knots(vis, plant, diagram, q_knots, 1.0 / fps)
             input()
     else:
@@ -239,6 +294,8 @@ def visualize_lafan(
             data = np.load(lafan_file, allow_pickle=True)
             fps = float(np.asarray(data["fps"]).reshape(-1)[0])
             q_knots = extract_q_knots(data)
+            if recenter:
+                q_knots, _ = _apply_visual_recenter(q_knots, None)
             draw_q_knots(vis, plant, diagram, q_knots, 1.0 / fps)
             input()
 
@@ -268,10 +325,16 @@ if __name__ == "__main__":
         default=DEFAULT_TERRAIN_MODEL_DIR,
         help="terrain URDF 模型的根目录。",
     )
+    parser.add_argument(
+        "--no-recenter",
+        action="store_true",
+        help="关闭可视化归一化；默认会把 terrain 平移到世界中心附近，若没有 terrain 则回到第一帧 root 附近。",
+    )
     args = parser.parse_args()
     visualize_lafan(
         base_path=args.input_dir,
         filter=args.filter,
         terrain=args.terrain,
         terrain_model_dir=args.terrain_model_dir,
+        recenter=not args.no_recenter,
     )
