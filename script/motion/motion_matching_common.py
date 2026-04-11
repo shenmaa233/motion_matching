@@ -640,10 +640,23 @@ def nearest_neighbor_search(query_feature: np.ndarray, database_features: np.nda
     return int(candidate_indices[int(np.argmin(distances))])
 
 
-def yaw_align_qpos_sequence(sequence_qpos: np.ndarray, target_root_quat: np.ndarray, target_root_pos: np.ndarray) -> np.ndarray:
+def yaw_align_qpos_sequence(
+    sequence_qpos: np.ndarray,
+    target_root_quat: np.ndarray,
+    target_root_pos: np.ndarray,
+    anchor_frame_index: int = 0,
+) -> np.ndarray:
     aligned = np.asarray(sequence_qpos, dtype=np.float64).copy()
-    source_root_quat = aligned[0, :4]
-    source_root_pos = aligned[0, 4:7]
+    if aligned.shape[0] == 0:
+        return aligned
+
+    if anchor_frame_index < 0:
+        anchor_frame_index += aligned.shape[0]
+    if anchor_frame_index < 0 or anchor_frame_index >= aligned.shape[0]:
+        raise IndexError(f"anchor_frame_index {anchor_frame_index} 超出序列范围 {aligned.shape[0]}")
+
+    source_root_quat = aligned[anchor_frame_index, :4]
+    source_root_pos = aligned[anchor_frame_index, 4:7]
 
     yaw_delta = wrap_angle(quaternion_to_yaw(target_root_quat) - quaternion_to_yaw(source_root_quat))
     yaw_quaternion = quaternion_from_yaw(float(yaw_delta))
@@ -666,25 +679,31 @@ def apply_inertialization_to_qpos_sequence(
     previous_qpos: np.ndarray | None,
     dt: float,
     damping: float,
+    preserve_root_pose: bool = False,
 ) -> np.ndarray:
     if previous_qpos is None:
         return np.asarray(aligned_qpos, dtype=np.float64)
 
     corrected = np.asarray(aligned_qpos, dtype=np.float64).copy()
-    delta_root_pos = previous_qpos[4:7] - corrected[0, 4:7]
     delta_joint = previous_qpos[7:] - corrected[0, 7:]
-    delta_root_rot = quaternion_to_rotation_vector(
-        quaternion_multiply(previous_qpos[:4], quaternion_conjugate(corrected[0, :4]))
-    )
+    if preserve_root_pose:
+        delta_root_pos = np.zeros(3, dtype=np.float64)
+        delta_root_rot = np.zeros(3, dtype=np.float64)
+    else:
+        delta_root_pos = previous_qpos[4:7] - corrected[0, 4:7]
+        delta_root_rot = quaternion_to_rotation_vector(
+            quaternion_multiply(previous_qpos[:4], quaternion_conjugate(corrected[0, :4]))
+        )
 
     for frame_index in range(corrected.shape[0]):
         time_seconds = frame_index * dt
-        corrected[frame_index, 4:7] += inertialization_offset(delta_root_pos, time_seconds, damping)
         corrected[frame_index, 7:] += inertialization_offset(delta_joint, time_seconds, damping)
-        correction_rotvec = inertialization_offset(delta_root_rot, time_seconds, damping)
-        correction_quat = rotation_vector_to_quaternion(correction_rotvec[None, :])[0]
-        corrected[frame_index, :4] = quaternion_multiply(correction_quat, corrected[frame_index, :4])
-        corrected[frame_index, :4] = normalize_quaternion(corrected[frame_index, :4])
+        if not preserve_root_pose:
+            corrected[frame_index, 4:7] += inertialization_offset(delta_root_pos, time_seconds, damping)
+            correction_rotvec = inertialization_offset(delta_root_rot, time_seconds, damping)
+            correction_quat = rotation_vector_to_quaternion(correction_rotvec[None, :])[0]
+            corrected[frame_index, :4] = quaternion_multiply(correction_quat, corrected[frame_index, :4])
+            corrected[frame_index, :4] = normalize_quaternion(corrected[frame_index, :4])
     return corrected
 
 

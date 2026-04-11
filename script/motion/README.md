@@ -19,7 +19,7 @@
 3. 生成批量轨迹：
    `python script/motion/generate_single_skill_batch.py --num-trajectories 4`
 4. 可视化生成结果：
-   `python script/visual/visualize_lafan.py --input-path output/motion_matching/generated/climb_15_z_scale_1.0 --terrain` 
+   `python script/visual/visualize_lafan.py --input-dir output/motion_matching/generated/climb_15_z_scale_1.0 --terrain` 
 
 ## 当前默认假设
 - 单技能只启用 `climb_15_z_scale_1.0`。
