@@ -45,6 +45,57 @@ class DatabaseBundle:
     manifest: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class StartPoseConfig:
+    standing_window_radius_frames: int
+    force_root_height_alignment: bool
+    root_height_offset_meters: float
+
+
+@dataclass(frozen=True)
+class PreSkillConfig:
+    speed_levels_mps: tuple[float, ...]
+    heading_degrees: tuple[float, ...]
+    start_distance_min_meters: float
+    start_distance_max_meters: float
+
+
+def _load_start_pose_config(config_path: Path) -> StartPoseConfig:
+    resolved_path = resolve_repo_path(config_path)
+    payload = json.loads(resolved_path.read_text(encoding="utf-8"))
+    start_pose_payload = payload.get("start_pose", {})
+    config = StartPoseConfig(
+        standing_window_radius_frames=int(start_pose_payload.get("standing_window_radius_frames", 2)),
+        force_root_height_alignment=bool(start_pose_payload.get("force_root_height_alignment", True)),
+        root_height_offset_meters=float(start_pose_payload.get("root_height_offset_meters", 0.0)),
+    )
+    if config.standing_window_radius_frames < 0:
+        raise ValueError(f"{resolved_path} 的 start_pose.standing_window_radius_frames 不能小于 0")
+    return config
+
+
+def _load_pre_skill_config(config_path: Path) -> PreSkillConfig:
+    resolved_path = resolve_repo_path(config_path)
+    payload = json.loads(resolved_path.read_text(encoding="utf-8"))
+    pre_skill_payload = payload.get("pre_skill", {})
+    start_distance_payload = pre_skill_payload.get("start_distance_meters", {})
+    config = PreSkillConfig(
+        speed_levels_mps=tuple(float(value) for value in pre_skill_payload.get("speed_levels_mps", DEFAULT_SPEED_LEVELS)),
+        heading_degrees=tuple(float(value) for value in pre_skill_payload.get("heading_degrees", DEFAULT_HEADING_DEGREES)),
+        start_distance_min_meters=float(start_distance_payload.get("min", 0.5)),
+        start_distance_max_meters=float(start_distance_payload.get("max", 6.0)),
+    )
+    if len(config.speed_levels_mps) == 0:
+        raise ValueError(f"{resolved_path} 的 pre_skill.speed_levels_mps 不能为空")
+    if len(config.heading_degrees) == 0:
+        raise ValueError(f"{resolved_path} 的 pre_skill.heading_degrees 不能为空")
+    if config.start_distance_min_meters < 0.0:
+        raise ValueError(f"{resolved_path} 的 pre_skill.start_distance_meters.min 不能小于 0")
+    if config.start_distance_max_meters < config.start_distance_min_meters:
+        raise ValueError(f"{resolved_path} 的 pre_skill.start_distance_meters.max 不能小于 min")
+    return config
+
+
 def _load_database_bundle(database_dir: Path) -> DatabaseBundle:
     database_dir = resolve_repo_path(database_dir)
     database_npz = database_dir / "motion_matching_db.npz"
@@ -206,6 +257,7 @@ def _select_standing_start(
     database: DatabaseBundle,
     clips: list[MotionClip],
     *,
+    target_root_height: float | None = None,
     window_radius: int = 2,
 ) -> tuple[MotionClip, int]:
     if len(database.locomotion_database_indices) == 0:
@@ -218,7 +270,7 @@ def _select_standing_start(
         ],
         dtype=np.float64,
     )
-    nominal_root_height = float(np.median(locomotion_root_heights))
+    reference_root_height = float(np.median(locomotion_root_heights)) if target_root_height is None else float(target_root_height)
 
     best_clip: MotionClip | None = None
     best_frame_index: int | None = None
@@ -238,7 +290,7 @@ def _select_standing_start(
         score = (
             mean_planar_speed
             + 0.5 * mean_yaw_rate
-            + 0.1 * abs(root_height - nominal_root_height)
+            + 1.0 * abs(root_height - reference_root_height)
             + 1e-3 * float(clip.mirrored)
         )
         if best_score is None or score < best_score:
@@ -249,6 +301,31 @@ def _select_standing_start(
     if best_clip is None or best_frame_index is None:
         raise ValueError("无法从 locomotion 数据库中选择 standing 起始帧")
     return best_clip, best_frame_index
+
+
+def _skill_entry_target_root_height(
+    *,
+    database: DatabaseBundle,
+    clips: list[MotionClip],
+    skill_metadata: dict[str, Any],
+) -> float:
+    skill_start_frame = int(skill_metadata["skill_start_frame"])
+    allow_mirrored_skill = skill_metadata.get("terrain_root_offset") is None
+    exact_frame_candidates = _skill_start_candidate_indices(
+        database=database,
+        clips=clips,
+        skill_name=skill_metadata["skill_name"],
+        skill_start_frame=skill_start_frame,
+        allow_mirrored=allow_mirrored_skill,
+    )
+    candidate_root_heights = np.asarray(
+        [
+            clips[int(database.clip_indices[int(database_index)])].qpos[int(database.frame_indices[int(database_index)]), 6]
+            for database_index in exact_frame_candidates
+        ],
+        dtype=np.float64,
+    )
+    return float(np.median(candidate_root_heights))
 
 
 def _append_clip_chunk(
@@ -421,15 +498,23 @@ def _generate_single_trajectory(
     clips: list[MotionClip],
     skill_metadata: dict[str, Any],
     rng: np.random.Generator,
+    pre_skill_config: PreSkillConfig,
+    start_pose_config: StartPoseConfig,
     search_interval_frames: int,
     command_spring_damping: float,
     inertialization_damping: float,
     post_skill_frames: int,
     kinematics: KinematicsHelper,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    speed_mps = float(rng.choice(np.asarray(DEFAULT_SPEED_LEVELS, dtype=np.float64)))
-    heading_deg = float(rng.choice(np.asarray(DEFAULT_HEADING_DEGREES, dtype=np.float64)))
-    pre_skill_seconds = float(rng.uniform(0.1, 3.0))
+    speed_mps = float(rng.choice(np.asarray(pre_skill_config.speed_levels_mps, dtype=np.float64)))
+    heading_deg = float(rng.choice(np.asarray(pre_skill_config.heading_degrees, dtype=np.float64)))
+    pre_skill_distance_meters = float(
+        rng.uniform(
+            pre_skill_config.start_distance_min_meters,
+            pre_skill_config.start_distance_max_meters,
+        )
+    )
+    pre_skill_seconds = pre_skill_distance_meters / max(speed_mps, 1e-6)
     pre_skill_frames = max(search_interval_frames, int(round(pre_skill_seconds * clips[0].fps)))
 
     approach_command = _command_vector_local(speed_mps, heading_deg)
@@ -457,8 +542,23 @@ def _generate_single_trajectory(
     fps = clips[0].fps
     dt = 1.0 / float(fps)
 
-    standing_clip, standing_frame_idx = _select_standing_start(database, clips)
-    output_qpos.append(standing_clip.qpos[standing_frame_idx].copy())
+    target_start_root_height = _skill_entry_target_root_height(
+        database=database,
+        clips=clips,
+        skill_metadata=skill_metadata,
+    )
+    desired_start_root_height = target_start_root_height + float(start_pose_config.root_height_offset_meters)
+    standing_clip, standing_frame_idx = _select_standing_start(
+        database,
+        clips,
+        target_root_height=target_start_root_height,
+        window_radius=start_pose_config.standing_window_radius_frames,
+    )
+    standing_qpos = standing_clip.qpos[standing_frame_idx].copy()
+    selected_start_root_height = float(standing_qpos[6])
+    if start_pose_config.force_root_height_alignment:
+        standing_qpos[6] = desired_start_root_height
+    output_qpos.append(standing_qpos)
     segments.append(
         _segment_record(
             mode="standing_initial",
@@ -604,6 +704,8 @@ def _generate_single_trajectory(
         fixed_skill_anchor_qpos[4:7],
         anchor_frame_index=len(output_qpos) - 1,
     )
+    if start_pose_config.force_root_height_alignment and aligned_approach_qpos.shape[0] > 0:
+        aligned_approach_qpos[0, 6] = desired_start_root_height
     output_qpos = [frame.copy() for frame in aligned_approach_qpos]
     skill_output_start = len(output_qpos)
     terrain_world_pose = _terrain_pose_from_fixed_skill(
@@ -681,6 +783,12 @@ def _generate_single_trajectory(
             "mode": "standing_initial",
             "clip_name": standing_clip.name,
             "source_frame": int(standing_frame_idx),
+            "selected_root_height": selected_start_root_height,
+            "target_root_height": float(target_start_root_height),
+            "desired_root_height": float(desired_start_root_height),
+            "final_root_height": float(output_qpos[0][6]),
+            "force_root_height_alignment": bool(start_pose_config.force_root_height_alignment),
+            "root_height_offset_meters": float(start_pose_config.root_height_offset_meters),
         },
         "skill_world_locked": True,
         "skill_anchor": {
@@ -693,6 +801,7 @@ def _generate_single_trajectory(
         "command": {
             "speed_mps": speed_mps,
             "heading_deg": heading_deg,
+            "pre_skill_distance_meters": pre_skill_distance_meters,
             "pre_skill_seconds": pre_skill_seconds,
             "pre_skill_frames": pre_skill_frames,
             "post_skill_frames": post_skill_frames,
@@ -744,6 +853,12 @@ def main() -> None:
         help="随机种子。",
     )
     parser.add_argument(
+        "--generation-config",
+        type=Path,
+        default=Path("data/motion_matching/trajectory_generation_config.json"),
+        help="轨迹生成配置 JSON，目前用于 start_pose 参数。",
+    )
+    parser.add_argument(
         "--search-interval-frames",
         type=int,
         default=DEFAULT_SEARCH_INTERVAL_FRAMES,
@@ -772,6 +887,8 @@ def main() -> None:
     database = _load_database_bundle(args.database_dir)
     clips = _load_clip_catalog(database.manifest)
     skill_metadata = _find_skill_metadata(database.manifest, args.skill_name)
+    pre_skill_config = _load_pre_skill_config(args.generation_config)
+    start_pose_config = _load_start_pose_config(args.generation_config)
     output_dir = resolve_repo_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -786,6 +903,8 @@ def main() -> None:
             clips=clips,
             skill_metadata=skill_metadata,
             rng=rng,
+            pre_skill_config=pre_skill_config,
+            start_pose_config=start_pose_config,
             search_interval_frames=args.search_interval_frames,
             command_spring_damping=args.command_spring_damping,
             inertialization_damping=args.inertialization_damping,
@@ -813,6 +932,20 @@ def main() -> None:
         "skill_name": args.skill_name,
         "num_trajectories": args.num_trajectories,
         "seed": args.seed,
+        "generation_config_path": str(resolve_repo_path(args.generation_config).relative_to(resolve_repo_path("."))),
+        "pre_skill_config": {
+            "speed_levels_mps": [float(value) for value in pre_skill_config.speed_levels_mps],
+            "heading_degrees": [float(value) for value in pre_skill_config.heading_degrees],
+            "start_distance_meters": {
+                "min": float(pre_skill_config.start_distance_min_meters),
+                "max": float(pre_skill_config.start_distance_max_meters),
+            },
+        },
+        "start_pose_config": {
+            "standing_window_radius_frames": int(start_pose_config.standing_window_radius_frames),
+            "force_root_height_alignment": bool(start_pose_config.force_root_height_alignment),
+            "root_height_offset_meters": float(start_pose_config.root_height_offset_meters),
+        },
         "trajectories": trajectory_manifests,
     }
     manifest_path = output_dir / "batch_manifest.json"

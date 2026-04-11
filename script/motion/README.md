@@ -23,5 +23,11 @@
 
 ## 当前默认假设
 - 单技能只启用 `climb_15_z_scale_1.0`。
+- `data/motion_matching/trajectory_generation_config.json` 里的 `start_pose`
+  用来控制 0 帧站立姿态选择，以及是否强制把 0 帧 root 高度对齐到
+  skill 进入高度。
+- 同一个配置文件里的 `pre_skill.start_distance_meters` 用来控制起始点到
+  skill 的距离；当前 `pre_skill_seconds` 是由距离和速度换算出来的结果，
+  不再是主采样量。
 - `terrain_root_offset` 目前是启发式占位值，仍然建议人工确认。
 - 左右镜像默认开启。
