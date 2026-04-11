@@ -1,7 +1,10 @@
 import argparse
 import glob
+import json
 import os
 import re
+import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import numpy as np
@@ -150,6 +153,57 @@ def _resolve_terrain_model_path(file_name: str, terrain_model_dir: str) -> str |
     return os.path.join(terrain_model_dir, terrain_folder, f"multi_boxes{z_scale}.urdf")
 
 
+def _load_generated_trajectory_index(base_path: str) -> dict[str, dict]:
+    base = Path(base_path)
+    manifest_path = base / "batch_manifest.json" if base.is_dir() else base.parent / "batch_manifest.json"
+    if not manifest_path.exists():
+        return {}
+
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    index: dict[str, dict] = {}
+    for trajectory in payload.get("trajectories", []):
+        trajectory_name = trajectory.get("trajectory_name")
+        trajectory_path = trajectory.get("trajectory_path")
+        if trajectory_name:
+            index[str(trajectory_name)] = trajectory
+        if trajectory_path:
+            index[Path(str(trajectory_path)).stem] = trajectory
+    return index
+
+
+def _write_transformed_terrain_urdf(terrain_urdf_path: str, terrain_world_pose: dict | None) -> str:
+    if not terrain_world_pose:
+        return terrain_urdf_path
+
+    source_path = Path(terrain_urdf_path).resolve()
+    root = ET.parse(source_path).getroot()
+    translation = np.asarray(terrain_world_pose.get("translation", [0.0, 0.0, 0.0]), dtype=np.float64)
+    yaw_deg = float(terrain_world_pose.get("yaw_deg", 0.0))
+    rpy = f"0 0 {np.deg2rad(yaw_deg)}"
+    xyz = " ".join(str(float(value)) for value in translation.tolist())
+
+    for mesh in root.findall(".//mesh"):
+        filename = mesh.attrib.get("filename")
+        if filename and not os.path.isabs(filename):
+            mesh.attrib["filename"] = str((source_path.parent / filename).resolve())
+
+    for joint in root.findall(".//joint"):
+        if joint.attrib.get("type") != "fixed":
+            continue
+        parent = joint.find("parent")
+        if parent is None or parent.attrib.get("link") != "world":
+            continue
+        origin = joint.find("origin")
+        if origin is None:
+            origin = ET.SubElement(joint, "origin")
+        origin.attrib["xyz"] = xyz
+        origin.attrib["rpy"] = rpy
+
+    with tempfile.NamedTemporaryFile("w", suffix=".urdf", delete=False, encoding="utf-8") as handle:
+        handle.write(ET.tostring(root, encoding="unicode"))
+        return handle.name
+
+
 def visualize_lafan(
     base_path: str = DEFAULT_INPUT_DIR,
     filter: str = "",
@@ -157,12 +211,21 @@ def visualize_lafan(
     terrain_model_dir: str = DEFAULT_TERRAIN_MODEL_DIR,
 ):
     lafan_files = find_files(base_path, filter=filter)
+    generated_trajectory_index = _load_generated_trajectory_index(base_path)
     if terrain:
         plant = vis = diagram = None
         for lafan_file in lafan_files:
             file_name = str(Path(lafan_file).stem)
             print(file_name)
-            terrain_model_path = _resolve_terrain_model_path(file_name, terrain_model_dir)
+            trajectory_manifest = generated_trajectory_index.get(file_name, {})
+            terrain_model_path = trajectory_manifest.get("terrain_path")
+            if terrain_model_path is not None:
+                terrain_model_path = str(Path(terrain_model_path))
+            else:
+                terrain_model_path = _resolve_terrain_model_path(file_name, terrain_model_dir)
+            terrain_world_pose = trajectory_manifest.get("terrain_world_pose")
+            if terrain_model_path is not None:
+                terrain_model_path = _write_transformed_terrain_urdf(terrain_model_path, terrain_world_pose)
             plant, vis, diagram = create_plant(ROBOT_SPHERE_HAND_PATH, terrain_model_path)
             data = np.load(lafan_file, allow_pickle=True)
             fps = float(np.asarray(data["fps"]).reshape(-1)[0])

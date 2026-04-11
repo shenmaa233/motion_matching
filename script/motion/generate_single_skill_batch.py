@@ -24,13 +24,11 @@ from motion_matching_common import (
     json_dump,
     load_motion_clip,
     mirror_motion_clip,
-    nearest_neighbor_search,
     normalize_features,
     quaternion_to_yaw,
     resolve_repo_path,
     sanitize_skill_name,
     wrap_angle,
-    yaw_align_qpos_sequence,
 )
 
 
@@ -253,6 +251,25 @@ def _skill_start_candidate_indices(
     return candidates
 
 
+def _skill_entry_candidate_indices(
+    *,
+    database: DatabaseBundle,
+    clips: list[MotionClip],
+    skill_name: str,
+    allow_mirrored: bool,
+) -> np.ndarray:
+    candidates = np.asarray(database.manifest["skill_entry_indices"][skill_name], dtype=np.int32)
+    if allow_mirrored:
+        return candidates
+
+    candidate_clip_indices = database.clip_indices[candidates]
+    mirrored_mask = np.asarray([clips[int(clip_index)].mirrored for clip_index in candidate_clip_indices], dtype=bool)
+    filtered = candidates[~mirrored_mask]
+    if len(filtered) == 0:
+        raise ValueError(f"{skill_name} 的 entry window 在过滤 mirrored skill 后为空")
+    return filtered
+
+
 def _select_standing_start(
     database: DatabaseBundle,
     clips: list[MotionClip],
@@ -455,6 +472,39 @@ def _select_skill_start_index(
     )
 
 
+def _select_skill_entry_index(
+    *,
+    query_feature: np.ndarray,
+    skill_metadata: dict[str, Any],
+    database: DatabaseBundle,
+    clips: list[MotionClip],
+) -> int:
+    skill_start_frame = int(skill_metadata["skill_start_frame"])
+    skill_end_frame = int(skill_metadata["skill_end_frame"])
+    allow_mirrored_skill = skill_metadata.get("terrain_root_offset") is None
+    entry_candidates = _skill_entry_candidate_indices(
+        database=database,
+        clips=clips,
+        skill_name=skill_metadata["skill_name"],
+        allow_mirrored=allow_mirrored_skill,
+    )
+
+    distances = np.linalg.norm(database.normalized_features[entry_candidates] - query_feature[None, :], axis=1)
+    ranked_indices = entry_candidates[np.argsort(distances)]
+    for database_index in ranked_indices:
+        clip_index = int(database.clip_indices[database_index])
+        frame_index = int(database.frame_indices[database_index])
+        if frame_index > skill_start_frame:
+            continue
+        clip = clips[clip_index]
+        available_future_frames = clip.num_frames - frame_index - 1
+        required_future_frames = max(0, skill_end_frame - frame_index)
+        if available_future_frames >= required_future_frames:
+            return int(database_index)
+
+    return int(ranked_indices[0])
+
+
 def _terrain_pose_from_fixed_skill(
     clip: MotionClip,
     source_frame: int,
@@ -520,23 +570,6 @@ def _generate_single_trajectory(
     approach_command = _command_vector_local(speed_mps, heading_deg)
     skill_command = np.asarray([speed_mps, 0.0], dtype=np.float64)
 
-    initial_query = np.concatenate(
-        (
-            build_runtime_query_feature(
-                np.zeros(3, dtype=np.float64),
-                np.zeros(3, dtype=np.float64),
-                np.zeros(3, dtype=np.float64),
-                np.zeros(3, dtype=np.float64),
-                np.zeros(3, dtype=np.float64),
-                approach_command,
-                damping=command_spring_damping,
-            )[:27],
-        ),
-        axis=0,
-    )
-    initial_query = normalize_features(initial_query, database.feature_mean, database.feature_std)
-    initial_database_index = nearest_neighbor_search(initial_query, database.normalized_features, database.locomotion_database_indices)
-
     output_qpos: list[np.ndarray] = []
     segments: list[dict[str, Any]] = []
     fps = clips[0].fps
@@ -569,74 +602,9 @@ def _generate_single_trajectory(
         )
     )
 
-    final_approach_frames = min(search_interval_frames, pre_skill_frames)
-    free_approach_frames = pre_skill_frames - final_approach_frames
-
-    if free_approach_frames > 0:
-        initial_clip = clips[int(database.clip_indices[initial_database_index])]
-        initial_frame = int(database.frame_indices[initial_database_index])
-        initial_new_frames = min(search_interval_frames, free_approach_frames)
-        initial_output_start = len(output_qpos)
-        initial_appended = _append_clip_chunk(
-            output_qpos=output_qpos,
-            clip=initial_clip,
-            source_start_frame=initial_frame,
-            desired_new_frames=initial_new_frames,
-            dt=dt,
-            inertialization_damping=inertialization_damping,
-        )
-        segments.append(
-            _segment_record(
-                mode="locomotion_approach",
-                clip=initial_clip,
-                source_start_frame=initial_frame,
-                num_output_frames=len(initial_appended),
-                output_start_frame=initial_output_start,
-            )
-        )
-
-        while len(output_qpos) < free_approach_frames:
-            remaining_frames = free_approach_frames - len(output_qpos)
-            query_feature = _build_query_from_output(
-                output_qpos=output_qpos,
-                kinematics=kinematics,
-                dt=dt,
-                command_local_velocity_xy=approach_command,
-                database=database,
-                command_spring_damping=command_spring_damping,
-            )
-            database_index = _select_candidate_index(
-                query_feature=query_feature,
-                candidate_indices=database.locomotion_database_indices,
-                database=database,
-                clips=clips,
-                minimum_future_frames=1,
-            )
-            clip = clips[int(database.clip_indices[database_index])]
-            frame_index = int(database.frame_indices[database_index])
-            output_start = len(output_qpos)
-            appended = _append_clip_chunk(
-                output_qpos=output_qpos,
-                clip=clip,
-                source_start_frame=frame_index,
-                desired_new_frames=min(search_interval_frames, remaining_frames),
-                dt=dt,
-                inertialization_damping=inertialization_damping,
-            )
-            if len(appended) == 0:
-                break
-            segments.append(
-                _segment_record(
-                    mode="locomotion_approach",
-                    clip=clip,
-                    source_start_frame=frame_index,
-                    num_output_frames=len(appended),
-                    output_start_frame=output_start,
-                )
-            )
-
-    skill_query = (
-        _build_query_from_output(
+    while (len(output_qpos) - 1) < pre_skill_frames:
+        remaining_frames = pre_skill_frames - (len(output_qpos) - 1)
+        query_feature = _build_query_from_output(
             output_qpos=output_qpos,
             kinematics=kinematics,
             dt=dt,
@@ -644,10 +612,45 @@ def _generate_single_trajectory(
             database=database,
             command_spring_damping=command_spring_damping,
         )
-        if output_qpos
-        else initial_query
+        database_index = _select_candidate_index(
+            query_feature=query_feature,
+            candidate_indices=database.locomotion_database_indices,
+            database=database,
+            clips=clips,
+            minimum_future_frames=1,
+        )
+        clip = clips[int(database.clip_indices[database_index])]
+        frame_index = int(database.frame_indices[database_index])
+        output_start = len(output_qpos)
+        appended = _append_clip_chunk(
+            output_qpos=output_qpos,
+            clip=clip,
+            source_start_frame=frame_index,
+            desired_new_frames=min(search_interval_frames, remaining_frames),
+            dt=dt,
+            inertialization_damping=inertialization_damping,
+        )
+        if len(appended) == 0:
+            break
+        segments.append(
+            _segment_record(
+                mode="locomotion_approach",
+                clip=clip,
+                source_start_frame=frame_index,
+                num_output_frames=len(appended),
+                output_start_frame=output_start,
+            )
+        )
+
+    skill_query = _build_query_from_output(
+        output_qpos=output_qpos,
+        kinematics=kinematics,
+        dt=dt,
+        command_local_velocity_xy=approach_command,
+        database=database,
+        command_spring_damping=command_spring_damping,
     )
-    skill_database_index = _select_skill_start_index(
+    skill_database_index = _select_skill_entry_index(
         query_feature=skill_query,
         skill_metadata=skill_metadata,
         database=database,
@@ -656,57 +659,6 @@ def _generate_single_trajectory(
     skill_clip = clips[int(database.clip_indices[skill_database_index])]
     skill_frame = int(database.frame_indices[skill_database_index])
     skill_end_frame = int(skill_metadata["skill_end_frame"])
-    fixed_skill_anchor_qpos = skill_clip.qpos[skill_frame]
-    skill_previous_frame = skill_clip.qpos[skill_frame - 1] if skill_frame > 0 else None
-    final_approach_query = _build_query_from_pose(
-        current_qpos=skill_clip.qpos[skill_frame],
-        previous_qpos=skill_previous_frame,
-        kinematics=kinematics,
-        dt=dt,
-        command_local_velocity_xy=approach_command,
-        database=database,
-        command_spring_damping=command_spring_damping,
-    )
-    final_approach_index = _select_candidate_index_with_history(
-        query_feature=final_approach_query,
-        candidate_indices=database.locomotion_database_indices,
-        database=database,
-        minimum_history_frames=final_approach_frames - (0 if output_qpos else 1),
-    )
-    final_approach_clip = clips[int(database.clip_indices[final_approach_index])]
-    final_approach_end_frame = int(database.frame_indices[final_approach_index])
-    final_approach_start_frame = max(
-        0,
-        final_approach_end_frame - final_approach_frames + (1 if not output_qpos else 0),
-    )
-    final_approach_output_start = len(output_qpos)
-    final_approach_appended = _append_clip_chunk(
-        output_qpos=output_qpos,
-        clip=final_approach_clip,
-        source_start_frame=final_approach_start_frame,
-        desired_new_frames=final_approach_frames,
-        dt=dt,
-        inertialization_damping=inertialization_damping,
-    )
-    segments.append(
-        _segment_record(
-            mode="locomotion_approach",
-            clip=final_approach_clip,
-            source_start_frame=final_approach_start_frame,
-            num_output_frames=len(final_approach_appended),
-            output_start_frame=final_approach_output_start,
-        )
-    )
-
-    aligned_approach_qpos = yaw_align_qpos_sequence(
-        np.asarray(output_qpos, dtype=np.float64),
-        fixed_skill_anchor_qpos[:4],
-        fixed_skill_anchor_qpos[4:7],
-        anchor_frame_index=len(output_qpos) - 1,
-    )
-    if start_pose_config.force_root_height_alignment and aligned_approach_qpos.shape[0] > 0:
-        aligned_approach_qpos[0, 6] = desired_start_root_height
-    output_qpos = [frame.copy() for frame in aligned_approach_qpos]
     skill_output_start = len(output_qpos)
     terrain_world_pose = _terrain_pose_from_fixed_skill(
         skill_clip,
@@ -720,7 +672,6 @@ def _generate_single_trajectory(
         desired_new_frames=max(0, skill_end_frame - skill_frame),
         dt=dt,
         inertialization_damping=inertialization_damping,
-        align_to_previous_root=False,
     )
     segments.append(
         _segment_record(
@@ -790,13 +741,13 @@ def _generate_single_trajectory(
             "force_root_height_alignment": bool(start_pose_config.force_root_height_alignment),
             "root_height_offset_meters": float(start_pose_config.root_height_offset_meters),
         },
-        "skill_world_locked": True,
+        "skill_world_locked": False,
         "skill_anchor": {
-            "fixed_world": True,
+            "fixed_world": False,
             "source_frame": int(skill_frame),
             "mirrored": bool(skill_clip.mirrored),
-            "root_translation": [float(value) for value in fixed_skill_anchor_qpos[4:7].tolist()],
-            "root_yaw_deg": float(np.rad2deg(quaternion_to_yaw(fixed_skill_anchor_qpos[:4]))),
+            "root_translation": [float(value) for value in skill_clip.qpos[skill_frame, 4:7].tolist()],
+            "root_yaw_deg": float(np.rad2deg(quaternion_to_yaw(skill_clip.qpos[skill_frame, :4]))),
         },
         "command": {
             "speed_mps": speed_mps,
