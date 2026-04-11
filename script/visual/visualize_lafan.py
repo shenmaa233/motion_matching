@@ -1,0 +1,214 @@
+import argparse
+import glob
+import os
+import re
+from pathlib import Path
+
+import numpy as np
+
+ROBOT_FAKE_HAND_PATH = "data/models/g1/g1_29dof.urdf"
+ROBOT_SPHERE_HAND_PATH = "data/models/g1/g1_29dof_spherehand.urdf"
+DEFAULT_INPUT_DIR = "data/locomotion"
+DEFAULT_TERRAIN_MODEL_DIR = "data/models/terrain"
+
+
+def create_plant(robot_model_path: str, object_model_path: str | list[str] | None = None):
+    from pydrake.all import (
+        AddMultibodyPlantSceneGraph,
+        DiagramBuilder,
+        MeshcatVisualizer,
+        MultibodyPlant,
+        Parser,
+        RigidTransform,
+        StartMeshcat,
+    )
+
+    builder = DiagramBuilder()
+    plant = MultibodyPlant(1e-3)
+    plant, scene_graph = AddMultibodyPlantSceneGraph(builder, plant=plant)
+    parser = Parser(plant=plant, scene_graph=scene_graph)
+    parser.AddModels(robot_model_path)
+    if object_model_path is not None:
+        if isinstance(object_model_path, list):
+            parser.SetAutoRenaming(True)
+            for model_path in object_model_path:
+                parser.AddModels(model_path)
+        else:
+            parser.AddModels(object_model_path)
+    parser.AddModels("data/models/ground_box.sdf")
+    plant.WeldFrames(
+        plant.world_frame(),
+        plant.GetFrameByName("ground_link"),
+        RigidTransform(np.array([0, 0, -0.5])),
+    )
+    plant.Finalize()
+    meshcat = StartMeshcat()
+    vis = MeshcatVisualizer.AddToBuilder(builder, scene_graph, meshcat)
+    diagram = builder.Build()
+    return plant, vis, diagram
+
+
+def draw_q_knots(vis, plant, diagram, q_knots, dt):
+    vis.DeleteRecording()
+    vis.StartRecording()
+    t_knots = np.arange(len(q_knots)) * dt
+    context = diagram.CreateDefaultContext()
+    plant_context = plant.GetMyMutableContextFromRoot(context)
+    vis_context = vis.GetMyMutableContextFromRoot(context)
+    for t, q in zip(t_knots, q_knots):
+        context.SetTime(t)
+        plant.SetPositions(plant_context, q)
+        vis.ForcedPublish(vis_context)
+    vis.StopRecording()
+    vis.PublishRecording()
+
+
+def _natural_sort_key(text: str):
+    parts = re.findall(r"\d+|\D+", text)
+    key = []
+    for part in parts:
+        if part.isdigit():
+            key.append((0, int(part)))
+        else:
+            key.append((1, part.lower()))
+    return tuple(key)
+
+
+def find_files(base_path: str, filter: str = "", extension: str = ".npz"):
+    if os.path.isfile(base_path):
+        return [base_path] if base_path.endswith(extension) else []
+    pattern = os.path.join(base_path, f"*{filter}*{extension}")
+    files = glob.glob(pattern)
+    return sorted(files, key=lambda p: _natural_sort_key(os.path.basename(p)))
+
+
+def _load_array(
+    data: np.lib.npyio.NpzFile,
+    name: str,
+    candidate_keys: tuple[str, ...],
+) -> tuple[str, np.ndarray]:
+    for key in candidate_keys:
+        if key in data:
+            return key, np.asarray(data[key], dtype=np.float64)
+
+    available_keys = ", ".join(sorted(data.files))
+    raise KeyError(
+        f"Missing {name}; tried keys {candidate_keys}. "
+        f"Available keys: {available_keys}"
+    )
+
+
+def _resolve_root_index(data: np.lib.npyio.NpzFile) -> int:
+    if "body_names" not in data:
+        return 0
+
+    body_names = [str(name) for name in np.asarray(data["body_names"]).tolist()]
+    for candidate in ("pelvis", "base", "root", "torso"):
+        if candidate in body_names:
+            return body_names.index(candidate)
+    return 0
+
+
+def extract_q_knots(data: np.lib.npyio.NpzFile) -> np.ndarray:
+    _, joint_positions = _load_array(
+        data,
+        "joint positions",
+        ("dof_positions", "joint_pos"),
+    )
+    _, body_positions = _load_array(
+        data,
+        "body positions",
+        ("body_positions", "body_pos_w"),
+    )
+    _, body_rotations = _load_array(
+        data,
+        "body rotations",
+        ("body_rotations", "body_quat_w"),
+    )
+
+    root_index = _resolve_root_index(data)
+
+    root_quaternions = body_rotations[:, root_index, :]
+    root_positions = body_positions[:, root_index, :]
+    return np.concatenate((root_quaternions, root_positions, joint_positions), axis=1)
+
+
+def _resolve_terrain_model_path(file_name: str, terrain_model_dir: str) -> str | None:
+    """从文件名中解析 terrain 文件夹名和 z_scale，返回对应的 URDF 路径。
+
+    文件名约定：前8个字符为 terrain 文件夹名（如 climb_00），
+    后缀包含 z_scale 信息（如 _z_scale_1.0）。
+    删除file_name最后的_0000
+    """
+    terrain_folder = file_name[:8]
+    if "z_scale" in file_name:
+        idx = file_name.index("z_scale") - 1
+        z_scale = file_name[idx:]
+        z_scale = re.sub(r"_\d+$", "", z_scale)  # 删除末尾的数字（如 _0000）
+    else:
+        z_scale = "_z_scale_1.0"
+    return os.path.join(terrain_model_dir, terrain_folder, f"multi_boxes{z_scale}.urdf")
+
+
+def visualize_lafan(
+    base_path: str = DEFAULT_INPUT_DIR,
+    filter: str = "",
+    terrain: bool = False,
+    terrain_model_dir: str = DEFAULT_TERRAIN_MODEL_DIR,
+):
+    lafan_files = find_files(base_path, filter=filter)
+    if terrain:
+        plant = vis = diagram = None
+        for lafan_file in lafan_files:
+            file_name = str(Path(lafan_file).stem)
+            print(file_name)
+            terrain_model_path = _resolve_terrain_model_path(file_name, terrain_model_dir)
+            plant, vis, diagram = create_plant(ROBOT_SPHERE_HAND_PATH, terrain_model_path)
+            data = np.load(lafan_file, allow_pickle=True)
+            fps = float(np.asarray(data["fps"]).reshape(-1)[0])
+            q_knots = extract_q_knots(data)
+            draw_q_knots(vis, plant, diagram, q_knots, 1.0 / fps)
+            input()
+    else:
+        plant, vis, diagram = create_plant(ROBOT_FAKE_HAND_PATH)
+        for lafan_file in lafan_files:
+            print(str(Path(lafan_file).stem))
+            data = np.load(lafan_file, allow_pickle=True)
+            fps = float(np.asarray(data["fps"]).reshape(-1)[0])
+            q_knots = extract_q_knots(data)
+            draw_q_knots(vis, plant, diagram, q_knots, 1.0 / fps)
+            input()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Visualize BeyondMimic-style G1 motion files in Drake.")
+    parser.add_argument(
+        "--input-dir",
+        type=str,
+        default=DEFAULT_INPUT_DIR,
+        help="目录或单个 `.npz` 轨迹文件。",
+    )
+    parser.add_argument(
+        "--filter",
+        type=str,
+        default="",
+        help="Only visualize files whose names contain this substring.",
+    )
+    parser.add_argument(
+        "--terrain",
+        action="store_true",
+        help="同时加载 terrain 模型（从文件名解析 terrain 文件夹和 z_scale）。",
+    )
+    parser.add_argument(
+        "--terrain-model-dir",
+        type=str,
+        default=DEFAULT_TERRAIN_MODEL_DIR,
+        help="terrain URDF 模型的根目录。",
+    )
+    args = parser.parse_args()
+    visualize_lafan(
+        base_path=args.input_dir,
+        filter=args.filter,
+        terrain=args.terrain,
+        terrain_model_dir=args.terrain_model_dir,
+    )

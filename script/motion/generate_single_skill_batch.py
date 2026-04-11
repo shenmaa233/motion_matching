@@ -1,0 +1,550 @@
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from motion_matching_common import (
+    DEFAULT_COMMAND_SPRING_DAMPING,
+    DEFAULT_HEADING_DEGREES,
+    DEFAULT_INERTIALIZATION_DAMPING,
+    DEFAULT_SEARCH_INTERVAL_FRAMES,
+    DEFAULT_SPEED_LEVELS,
+    KinematicsHelper,
+    MotionClip,
+    build_runtime_query_feature,
+    clip_name_from_path,
+    compose_transition,
+    export_qpos_trajectory_to_beyond_mimic,
+    json_dump,
+    load_motion_clip,
+    mirror_motion_clip,
+    nearest_neighbor_search,
+    normalize_features,
+    resolve_repo_path,
+    sanitize_skill_name,
+    wrap_angle,
+)
+
+
+@dataclass
+class DatabaseBundle:
+    normalized_features: np.ndarray
+    feature_mean: np.ndarray
+    feature_std: np.ndarray
+    clip_indices: np.ndarray
+    frame_indices: np.ndarray
+    locomotion_database_indices: np.ndarray
+    manifest: dict[str, Any]
+
+
+def _load_database_bundle(database_dir: Path) -> DatabaseBundle:
+    database_dir = resolve_repo_path(database_dir)
+    database_npz = database_dir / "motion_matching_db.npz"
+    manifest_json = database_dir / "motion_matching_db.json"
+    if not database_npz.exists():
+        raise FileNotFoundError(f"找不到数据库文件: {database_npz}")
+    if not manifest_json.exists():
+        raise FileNotFoundError(f"找不到数据库清单: {manifest_json}")
+
+    payload = np.load(database_npz, allow_pickle=True)
+    manifest = json.loads(manifest_json.read_text(encoding="utf-8"))
+    return DatabaseBundle(
+        normalized_features=np.asarray(payload["normalized_features"], dtype=np.float64),
+        feature_mean=np.asarray(payload["feature_mean"], dtype=np.float64),
+        feature_std=np.asarray(payload["feature_std"], dtype=np.float64),
+        clip_indices=np.asarray(payload["clip_indices"], dtype=np.int32),
+        frame_indices=np.asarray(payload["frame_indices"], dtype=np.int32),
+        locomotion_database_indices=np.asarray(payload["locomotion_database_indices"], dtype=np.int32),
+        manifest=manifest,
+    )
+
+
+def _load_clip_catalog(manifest: dict[str, Any]) -> list[MotionClip]:
+    cache: dict[str, MotionClip] = {}
+    clips: list[MotionClip] = []
+    for clip_entry in manifest["clips"]:
+        source_path = str(clip_entry["path"])
+        if source_path not in cache:
+            cache[source_path] = load_motion_clip(source_path, clip_name=clip_name_from_path(resolve_repo_path(source_path)))
+        base_clip = cache[source_path]
+        clip = mirror_motion_clip(base_clip) if clip_entry["mirrored"] else base_clip
+        if clip.name != clip_entry["name"]:
+            clip = MotionClip(
+                name=str(clip_entry["name"]),
+                source_path=clip.source_path,
+                qpos=clip.qpos,
+                joint_pos=clip.joint_pos,
+                joint_vel=clip.joint_vel,
+                body_pos_w=clip.body_pos_w,
+                body_quat_w=clip.body_quat_w,
+                body_lin_vel_w=clip.body_lin_vel_w,
+                body_ang_vel_w=clip.body_ang_vel_w,
+                fps=clip.fps,
+                mirrored=clip.mirrored,
+                source_name=clip.source_name,
+            )
+        clips.append(clip)
+    return clips
+
+
+def _find_skill_metadata(manifest: dict[str, Any], skill_name: str) -> dict[str, Any]:
+    for skill in manifest["skills"]:
+        if skill["skill_name"] == skill_name:
+            return skill
+    available = [skill["skill_name"] for skill in manifest["skills"]]
+    raise KeyError(f"数据库中没有技能 {skill_name}，可选值: {available}")
+
+
+def _select_candidate_index(
+    *,
+    query_feature: np.ndarray,
+    candidate_indices: np.ndarray,
+    database: DatabaseBundle,
+    clips: list[MotionClip],
+    minimum_future_frames: int,
+    maximum_frame_index: int | None = None,
+) -> int:
+    if len(candidate_indices) == 0:
+        raise ValueError("候选集合为空")
+
+    distances = np.linalg.norm(database.normalized_features[candidate_indices] - query_feature[None, :], axis=1)
+    ranked_indices = candidate_indices[np.argsort(distances)]
+    for database_index in ranked_indices:
+        clip_index = int(database.clip_indices[database_index])
+        frame_index = int(database.frame_indices[database_index])
+        clip = clips[clip_index]
+        if maximum_frame_index is not None and frame_index > maximum_frame_index:
+            continue
+        available_future_frames = clip.num_frames - frame_index - 1
+        if available_future_frames >= minimum_future_frames:
+            return int(database_index)
+
+    return int(ranked_indices[0])
+
+
+def _command_vector_local(speed_mps: float, heading_deg: float) -> np.ndarray:
+    heading_rad = np.deg2rad(float(heading_deg))
+    return np.asarray([speed_mps * np.cos(heading_rad), speed_mps * np.sin(heading_rad)], dtype=np.float64)
+
+
+def _build_query_from_output(
+    *,
+    output_qpos: list[np.ndarray],
+    kinematics: KinematicsHelper,
+    dt: float,
+    command_local_velocity_xy: np.ndarray,
+    database: DatabaseBundle,
+    command_spring_damping: float,
+) -> np.ndarray:
+    current_qpos = output_qpos[-1]
+    previous_qpos = output_qpos[-2] if len(output_qpos) >= 2 else None
+    pose_state = kinematics.runtime_pose_features(current_qpos, previous_qpos, dt)
+    query_feature = build_runtime_query_feature(
+        pose_state["left_foot_local_pos"],
+        pose_state["right_foot_local_pos"],
+        pose_state["left_foot_local_vel"],
+        pose_state["right_foot_local_vel"],
+        pose_state["root_local_velocity"],
+        command_local_velocity_xy,
+        damping=command_spring_damping,
+    )
+    return normalize_features(query_feature, database.feature_mean, database.feature_std)
+
+
+def _append_clip_chunk(
+    *,
+    output_qpos: list[np.ndarray],
+    clip: MotionClip,
+    source_start_frame: int,
+    desired_new_frames: int,
+    dt: float,
+    inertialization_damping: float,
+) -> np.ndarray:
+    if desired_new_frames <= 0:
+        return np.zeros((0, clip.qpos.shape[1]), dtype=np.float64)
+
+    previous_qpos = output_qpos[-1] if output_qpos else None
+    if previous_qpos is None:
+        source_end_frame = min(clip.num_frames, source_start_frame + desired_new_frames)
+        source_segment = clip.qpos[source_start_frame:source_end_frame]
+        appended = compose_transition(source_segment, None, dt, inertialization_damping)
+    else:
+        source_end_frame = min(clip.num_frames, source_start_frame + desired_new_frames + 1)
+        if source_end_frame - source_start_frame < 2:
+            return np.zeros((0, clip.qpos.shape[1]), dtype=np.float64)
+        source_segment = clip.qpos[source_start_frame:source_end_frame]
+        transitioned = compose_transition(source_segment, previous_qpos, dt, inertialization_damping)
+        appended = transitioned[1:]
+
+    for frame in appended:
+        output_qpos.append(frame.copy())
+    return appended
+
+
+def _segment_record(
+    *,
+    mode: str,
+    clip: MotionClip,
+    source_start_frame: int,
+    num_output_frames: int,
+    output_start_frame: int,
+) -> dict[str, Any]:
+    return {
+        "mode": mode,
+        "clip_name": clip.name,
+        "source_name": clip.source_name,
+        "mirrored": clip.mirrored,
+        "source_start_frame": int(source_start_frame),
+        "source_end_frame": int(source_start_frame + max(num_output_frames - 1, 0)),
+        "output_start_frame": int(output_start_frame),
+        "output_end_frame": int(output_start_frame + max(num_output_frames - 1, 0)),
+    }
+
+
+def _terrain_pose_from_transition(root_qpos: np.ndarray, terrain_root_offset: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not terrain_root_offset:
+        return None
+
+    translation_local = np.asarray(terrain_root_offset.get("translation", [0.0, 0.0, 0.0]), dtype=np.float64)
+    yaw_deg = float(terrain_root_offset.get("yaw_deg", 0.0))
+    root_yaw = float(np.rad2deg(wrap_angle(np.arctan2(2.0 * (root_qpos[0] * root_qpos[3] + root_qpos[1] * root_qpos[2]), 1.0 - 2.0 * (root_qpos[2] ** 2 + root_qpos[3] ** 2)))))
+    yaw_rad = np.deg2rad(root_yaw)
+    rotation = np.asarray(
+        (
+            (np.cos(yaw_rad), -np.sin(yaw_rad), 0.0),
+            (np.sin(yaw_rad), np.cos(yaw_rad), 0.0),
+            (0.0, 0.0, 1.0),
+        ),
+        dtype=np.float64,
+    )
+    terrain_translation = root_qpos[4:7] + rotation @ translation_local
+    return {
+        "translation": [float(value) for value in terrain_translation.tolist()],
+        "yaw_deg": float(root_yaw + yaw_deg),
+    }
+
+
+def _generate_single_trajectory(
+    *,
+    database: DatabaseBundle,
+    clips: list[MotionClip],
+    skill_metadata: dict[str, Any],
+    rng: np.random.Generator,
+    search_interval_frames: int,
+    command_spring_damping: float,
+    inertialization_damping: float,
+    post_skill_frames: int,
+    kinematics: KinematicsHelper,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    speed_mps = float(rng.choice(np.asarray(DEFAULT_SPEED_LEVELS, dtype=np.float64)))
+    heading_deg = float(rng.choice(np.asarray(DEFAULT_HEADING_DEGREES, dtype=np.float64)))
+    pre_skill_seconds = float(rng.uniform(0.1, 3.0))
+    pre_skill_frames = max(search_interval_frames, int(round(pre_skill_seconds * clips[0].fps)))
+
+    approach_command = _command_vector_local(speed_mps, heading_deg)
+    skill_command = np.asarray([speed_mps, 0.0], dtype=np.float64)
+
+    initial_query = np.concatenate(
+        (
+            build_runtime_query_feature(
+                np.zeros(3, dtype=np.float64),
+                np.zeros(3, dtype=np.float64),
+                np.zeros(3, dtype=np.float64),
+                np.zeros(3, dtype=np.float64),
+                np.zeros(3, dtype=np.float64),
+                approach_command,
+                damping=command_spring_damping,
+            )[:27],
+        ),
+        axis=0,
+    )
+    initial_query = normalize_features(initial_query, database.feature_mean, database.feature_std)
+    initial_database_index = nearest_neighbor_search(initial_query, database.normalized_features, database.locomotion_database_indices)
+
+    output_qpos: list[np.ndarray] = []
+    segments: list[dict[str, Any]] = []
+    fps = clips[int(database.clip_indices[initial_database_index])].fps
+    dt = 1.0 / float(fps)
+
+    initial_clip = clips[int(database.clip_indices[initial_database_index])]
+    initial_frame = int(database.frame_indices[initial_database_index])
+    initial_new_frames = min(search_interval_frames, pre_skill_frames)
+    initial_output_start = len(output_qpos)
+    initial_appended = _append_clip_chunk(
+        output_qpos=output_qpos,
+        clip=initial_clip,
+        source_start_frame=initial_frame,
+        desired_new_frames=initial_new_frames,
+        dt=dt,
+        inertialization_damping=inertialization_damping,
+    )
+    segments.append(
+        _segment_record(
+            mode="locomotion_approach",
+            clip=initial_clip,
+            source_start_frame=initial_frame,
+            num_output_frames=len(initial_appended),
+            output_start_frame=initial_output_start,
+        )
+    )
+
+    while len(output_qpos) < pre_skill_frames:
+        remaining_frames = pre_skill_frames - len(output_qpos)
+        query_feature = _build_query_from_output(
+            output_qpos=output_qpos,
+            kinematics=kinematics,
+            dt=dt,
+            command_local_velocity_xy=approach_command,
+            database=database,
+            command_spring_damping=command_spring_damping,
+        )
+        database_index = _select_candidate_index(
+            query_feature=query_feature,
+            candidate_indices=database.locomotion_database_indices,
+            database=database,
+            clips=clips,
+            minimum_future_frames=1,
+        )
+        clip = clips[int(database.clip_indices[database_index])]
+        frame_index = int(database.frame_indices[database_index])
+        output_start = len(output_qpos)
+        appended = _append_clip_chunk(
+            output_qpos=output_qpos,
+            clip=clip,
+            source_start_frame=frame_index,
+            desired_new_frames=min(search_interval_frames, remaining_frames),
+            dt=dt,
+            inertialization_damping=inertialization_damping,
+        )
+        if len(appended) == 0:
+            break
+        segments.append(
+            _segment_record(
+                mode="locomotion_approach",
+                clip=clip,
+                source_start_frame=frame_index,
+                num_output_frames=len(appended),
+                output_start_frame=output_start,
+            )
+        )
+
+    skill_entry_candidates = np.asarray(database.manifest["skill_entry_indices"][skill_metadata["skill_name"]], dtype=np.int32)
+    skill_end_frame = int(skill_metadata["skill_end_frame"])
+    skill_query = _build_query_from_output(
+        output_qpos=output_qpos,
+        kinematics=kinematics,
+        dt=dt,
+        command_local_velocity_xy=approach_command,
+        database=database,
+        command_spring_damping=command_spring_damping,
+    )
+    skill_database_index = _select_candidate_index(
+        query_feature=skill_query,
+        candidate_indices=skill_entry_candidates,
+        database=database,
+        clips=clips,
+        minimum_future_frames=1,
+        maximum_frame_index=skill_end_frame - 1,
+    )
+    skill_clip = clips[int(database.clip_indices[skill_database_index])]
+    skill_frame = int(database.frame_indices[skill_database_index])
+    skill_output_start = len(output_qpos)
+    terrain_world_pose = _terrain_pose_from_transition(output_qpos[-1], skill_metadata.get("terrain_root_offset"))
+    skill_appended = _append_clip_chunk(
+        output_qpos=output_qpos,
+        clip=skill_clip,
+        source_start_frame=skill_frame,
+        desired_new_frames=skill_end_frame - skill_frame,
+        dt=dt,
+        inertialization_damping=inertialization_damping,
+    )
+    segments.append(
+        _segment_record(
+            mode="skill_execution",
+            clip=skill_clip,
+            source_start_frame=skill_frame,
+            num_output_frames=len(skill_appended),
+            output_start_frame=skill_output_start,
+        )
+    )
+
+    target_total_frames = len(output_qpos) + post_skill_frames
+    while len(output_qpos) < target_total_frames:
+        remaining_frames = target_total_frames - len(output_qpos)
+        query_feature = _build_query_from_output(
+            output_qpos=output_qpos,
+            kinematics=kinematics,
+            dt=dt,
+            command_local_velocity_xy=skill_command,
+            database=database,
+            command_spring_damping=command_spring_damping,
+        )
+        database_index = _select_candidate_index(
+            query_feature=query_feature,
+            candidate_indices=database.locomotion_database_indices,
+            database=database,
+            clips=clips,
+            minimum_future_frames=1,
+        )
+        clip = clips[int(database.clip_indices[database_index])]
+        frame_index = int(database.frame_indices[database_index])
+        output_start = len(output_qpos)
+        appended = _append_clip_chunk(
+            output_qpos=output_qpos,
+            clip=clip,
+            source_start_frame=frame_index,
+            desired_new_frames=min(search_interval_frames, remaining_frames),
+            dt=dt,
+            inertialization_damping=inertialization_damping,
+        )
+        if len(appended) == 0:
+            break
+        segments.append(
+            _segment_record(
+                mode="locomotion_recovery",
+                clip=clip,
+                source_start_frame=frame_index,
+                num_output_frames=len(appended),
+                output_start_frame=output_start,
+            )
+        )
+
+    manifest = {
+        "skill_name": skill_metadata["skill_name"],
+        "terrain_path": skill_metadata["terrain_path"],
+        "terrain_world_pose": terrain_world_pose,
+        "annotation_source": skill_metadata.get("annotation_source", "manual"),
+        "needs_review": bool(skill_metadata.get("needs_review", False)),
+        "command": {
+            "speed_mps": speed_mps,
+            "heading_deg": heading_deg,
+            "pre_skill_seconds": pre_skill_seconds,
+            "pre_skill_frames": pre_skill_frames,
+            "post_skill_frames": post_skill_frames,
+        },
+        "search": {
+            "interval_frames": search_interval_frames,
+            "command_spring_damping": command_spring_damping,
+            "inertialization_damping": inertialization_damping,
+        },
+        "segments": segments,
+    }
+    return np.asarray(output_qpos, dtype=np.float64), manifest
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="生成单技能 motion matching 批量轨迹。")
+    parser.add_argument(
+        "--database-dir",
+        type=Path,
+        default=Path("output/motion_matching/single_skill_db"),
+        help="数据库目录，需要包含 motion_matching_db.npz 和 motion_matching_db.json。",
+    )
+    parser.add_argument(
+        "--skill-name",
+        type=str,
+        default="climb_15_z_scale_1.0",
+        help="要生成的技能名。",
+    )
+    parser.add_argument(
+        "--num-trajectories",
+        type=int,
+        default=1,
+        help="要生成的轨迹数量。",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("output/motion_matching/generated/climb_15_z_scale_1.0"),
+        help="轨迹输出目录。",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="随机种子。",
+    )
+    parser.add_argument(
+        "--search-interval-frames",
+        type=int,
+        default=DEFAULT_SEARCH_INTERVAL_FRAMES,
+        help="locomotion 检索周期。",
+    )
+    parser.add_argument(
+        "--command-spring-damping",
+        type=float,
+        default=DEFAULT_COMMAND_SPRING_DAMPING,
+        help="命令未来轨迹弹簧阻尼。",
+    )
+    parser.add_argument(
+        "--inertialization-damping",
+        type=float,
+        default=DEFAULT_INERTIALIZATION_DAMPING,
+        help="切换过渡的 inertialization 阻尼。",
+    )
+    parser.add_argument(
+        "--post-skill-seconds",
+        type=float,
+        default=2.0,
+        help="技能结束后继续 locomotion 的时长。",
+    )
+    args = parser.parse_args()
+
+    database = _load_database_bundle(args.database_dir)
+    clips = _load_clip_catalog(database.manifest)
+    skill_metadata = _find_skill_metadata(database.manifest, args.skill_name)
+    output_dir = resolve_repo_path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    rng = np.random.default_rng(args.seed)
+    kinematics = KinematicsHelper()
+    post_skill_frames = max(1, int(round(float(args.post_skill_seconds) * clips[0].fps)))
+
+    trajectory_manifests: list[dict[str, Any]] = []
+    for trajectory_index in range(args.num_trajectories):
+        qpos_trajectory, trajectory_manifest = _generate_single_trajectory(
+            database=database,
+            clips=clips,
+            skill_metadata=skill_metadata,
+            rng=rng,
+            search_interval_frames=args.search_interval_frames,
+            command_spring_damping=args.command_spring_damping,
+            inertialization_damping=args.inertialization_damping,
+            post_skill_frames=post_skill_frames,
+            kinematics=kinematics,
+        )
+
+        trajectory_name = f"{sanitize_skill_name(args.skill_name)}_{trajectory_index:04d}"
+        trajectory_path = output_dir / f"{trajectory_name}.npz"
+        export_qpos_trajectory_to_beyond_mimic(
+            qpos_trajectory,
+            clips[0].fps,
+            trajectory_path,
+            kinematics=kinematics,
+        )
+        trajectory_manifest["trajectory_name"] = trajectory_name
+        trajectory_manifest["trajectory_path"] = str(trajectory_path.relative_to(resolve_repo_path(".")))
+        trajectory_manifest["num_frames"] = int(qpos_trajectory.shape[0])
+        trajectory_manifests.append(trajectory_manifest)
+        print(f"[ok] 已生成 {trajectory_path}")
+
+    batch_manifest = {
+        "version": 1,
+        "database_dir": str(resolve_repo_path(args.database_dir).relative_to(resolve_repo_path("."))),
+        "skill_name": args.skill_name,
+        "num_trajectories": args.num_trajectories,
+        "seed": args.seed,
+        "trajectories": trajectory_manifests,
+    }
+    manifest_path = output_dir / "batch_manifest.json"
+    json_dump(manifest_path, batch_manifest)
+    print(f"[ok] 批量清单已写出到 {manifest_path}")
+
+
+if __name__ == "__main__":
+    main()
