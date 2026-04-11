@@ -202,6 +202,55 @@ def _skill_start_candidate_indices(
     return candidates
 
 
+def _select_standing_start(
+    database: DatabaseBundle,
+    clips: list[MotionClip],
+    *,
+    window_radius: int = 2,
+) -> tuple[MotionClip, int]:
+    if len(database.locomotion_database_indices) == 0:
+        raise ValueError("locomotion 数据库为空，无法选择 standing 起始帧")
+
+    locomotion_root_heights = np.asarray(
+        [
+            clips[int(database.clip_indices[int(database_index)])].qpos[int(database.frame_indices[int(database_index)]), 6]
+            for database_index in database.locomotion_database_indices
+        ],
+        dtype=np.float64,
+    )
+    nominal_root_height = float(np.median(locomotion_root_heights))
+
+    best_clip: MotionClip | None = None
+    best_frame_index: int | None = None
+    best_score: float | None = None
+
+    for database_index in database.locomotion_database_indices:
+        clip = clips[int(database.clip_indices[int(database_index)])]
+        frame_index = int(database.frame_indices[int(database_index)])
+        window_start = max(0, frame_index - window_radius)
+        window_end = min(clip.num_frames, frame_index + window_radius + 1)
+
+        root_planar_speed = np.linalg.norm(clip.body_lin_vel_w[window_start:window_end, 0, :2], axis=1)
+        mean_planar_speed = float(np.mean(root_planar_speed))
+        mean_yaw_rate = float(np.mean(np.abs(clip.body_ang_vel_w[window_start:window_end, 0, 2])))
+        root_height = float(clip.qpos[frame_index, 6])
+
+        score = (
+            mean_planar_speed
+            + 0.5 * mean_yaw_rate
+            + 0.1 * abs(root_height - nominal_root_height)
+            + 1e-3 * float(clip.mirrored)
+        )
+        if best_score is None or score < best_score:
+            best_score = score
+            best_clip = clip
+            best_frame_index = frame_index
+
+    if best_clip is None or best_frame_index is None:
+        raise ValueError("无法从 locomotion 数据库中选择 standing 起始帧")
+    return best_clip, best_frame_index
+
+
 def _append_clip_chunk(
     *,
     output_qpos: list[np.ndarray],
@@ -407,6 +456,18 @@ def _generate_single_trajectory(
     segments: list[dict[str, Any]] = []
     fps = clips[0].fps
     dt = 1.0 / float(fps)
+
+    standing_clip, standing_frame_idx = _select_standing_start(database, clips)
+    output_qpos.append(standing_clip.qpos[standing_frame_idx].copy())
+    segments.append(
+        _segment_record(
+            mode="standing_initial",
+            clip=standing_clip,
+            source_start_frame=standing_frame_idx,
+            num_output_frames=1,
+            output_start_frame=0,
+        )
+    )
 
     final_approach_frames = min(search_interval_frames, pre_skill_frames)
     free_approach_frames = pre_skill_frames - final_approach_frames
@@ -616,6 +677,11 @@ def _generate_single_trajectory(
         "terrain_world_pose": terrain_world_pose,
         "annotation_source": skill_metadata.get("annotation_source", "manual"),
         "needs_review": bool(skill_metadata.get("needs_review", False)),
+        "start_pose": {
+            "mode": "standing_initial",
+            "clip_name": standing_clip.name,
+            "source_frame": int(standing_frame_idx),
+        },
         "skill_world_locked": True,
         "skill_anchor": {
             "fixed_world": True,
