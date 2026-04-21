@@ -21,6 +21,10 @@
 4. 可视化生成结果：
    `python script/visual/visualize_lafan.py --input-dir output/motion_matching/generated/climb_15_z_scale_1.0 --terrain` 
 
+## 相关文档
+- `docs/approach_steering_fix.md`
+  记录 pre-skill 阶段“先绕大圈再接 obstacle”的问题分析、steering 修复方案和参数含义。
+
 ## 当前默认假设
 - 单技能只启用 `climb_15_z_scale_1.0`。
 - `data/motion_matching/trajectory_generation_config.json` 里的 `start_pose`
@@ -29,5 +33,7 @@
 - 同一个配置文件里的 `pre_skill.start_distance_meters` 用来控制起始点到
   skill 的距离；当前 `pre_skill_seconds` 是由距离和速度换算出来的结果，
   不再是主采样量。
+- `pre_skill.approach_direction_window_frames` 用来控制动态 steering 回看
+  多长的 skill 入口历史位移，以估计当前 approach 的局部方向。
 - `terrain_root_offset` 目前是启发式占位值，仍然建议人工确认。
 - 左右镜像默认开启。

@@ -29,6 +29,7 @@ from motion_matching_common import (
     resolve_repo_path,
     sanitize_skill_name,
     wrap_angle,
+    world_to_local_vector,
 )
 
 
@@ -56,6 +57,7 @@ class PreSkillConfig:
     heading_degrees: tuple[float, ...]
     start_distance_min_meters: float
     start_distance_max_meters: float
+    approach_direction_window_frames: int
 
 
 def _load_start_pose_config(config_path: Path) -> StartPoseConfig:
@@ -82,6 +84,7 @@ def _load_pre_skill_config(config_path: Path) -> PreSkillConfig:
         heading_degrees=tuple(float(value) for value in pre_skill_payload.get("heading_degrees", DEFAULT_HEADING_DEGREES)),
         start_distance_min_meters=float(start_distance_payload.get("min", 0.5)),
         start_distance_max_meters=float(start_distance_payload.get("max", 6.0)),
+        approach_direction_window_frames=int(pre_skill_payload.get("approach_direction_window_frames", 30)),
     )
     if len(config.speed_levels_mps) == 0:
         raise ValueError(f"{resolved_path} 的 pre_skill.speed_levels_mps 不能为空")
@@ -91,6 +94,8 @@ def _load_pre_skill_config(config_path: Path) -> PreSkillConfig:
         raise ValueError(f"{resolved_path} 的 pre_skill.start_distance_meters.min 不能小于 0")
     if config.start_distance_max_meters < config.start_distance_min_meters:
         raise ValueError(f"{resolved_path} 的 pre_skill.start_distance_meters.max 不能小于 min")
+    if config.approach_direction_window_frames < 1:
+        raise ValueError(f"{resolved_path} 的 pre_skill.approach_direction_window_frames 不能小于 1")
     return config
 
 
@@ -505,6 +510,34 @@ def _select_skill_entry_index(
     return int(ranked_indices[0])
 
 
+def _approach_command_from_skill_entry_candidate(
+    *,
+    database_index: int,
+    database: DatabaseBundle,
+    clips: list[MotionClip],
+    desired_speed_mps: float,
+    direction_window_frames: int,
+) -> np.ndarray:
+    clip_index = int(database.clip_indices[database_index])
+    frame_index = int(database.frame_indices[database_index])
+    clip = clips[clip_index]
+
+    window_start = max(0, frame_index - direction_window_frames)
+    source_root_pos = np.asarray(clip.qpos[frame_index, 4:7], dtype=np.float64)
+    source_root_yaw = float(quaternion_to_yaw(clip.qpos[frame_index, :4]))
+    source_displacement = source_root_pos - np.asarray(clip.qpos[window_start, 4:7], dtype=np.float64)
+    local_displacement = world_to_local_vector(source_displacement, source_root_yaw)[:2]
+
+    if np.linalg.norm(local_displacement) < 1e-4:
+        local_velocity = world_to_local_vector(clip.body_lin_vel_w[frame_index, 0], source_root_yaw)[:2]
+        local_displacement = local_velocity
+
+    direction_norm = float(np.linalg.norm(local_displacement))
+    if direction_norm < 1e-6:
+        return np.asarray([desired_speed_mps, 0.0], dtype=np.float64)
+    return (local_displacement / direction_norm) * float(desired_speed_mps)
+
+
 def _terrain_pose_from_root_qpos(
     root_qpos: np.ndarray,
     *,
@@ -631,6 +664,8 @@ def _generate_single_trajectory(
 
     approach_command = _command_vector_local(speed_mps, heading_deg)
     skill_command = np.asarray([speed_mps, 0.0], dtype=np.float64)
+    steering_clip_name: str | None = None
+    steering_source_frame: int | None = None
 
     output_qpos: list[np.ndarray] = []
     segments: list[dict[str, Any]] = []
@@ -666,6 +701,31 @@ def _generate_single_trajectory(
 
     while (len(output_qpos) - 1) < pre_skill_frames:
         remaining_frames = pre_skill_frames - (len(output_qpos) - 1)
+        steering_query = _build_query_from_output(
+            output_qpos=output_qpos,
+            kinematics=kinematics,
+            dt=dt,
+            command_local_velocity_xy=approach_command,
+            database=database,
+            command_spring_damping=command_spring_damping,
+        )
+        steering_skill_index = _select_skill_entry_index(
+            query_feature=steering_query,
+            skill_metadata=skill_metadata,
+            database=database,
+            clips=clips,
+        )
+        approach_command = _approach_command_from_skill_entry_candidate(
+            database_index=steering_skill_index,
+            database=database,
+            clips=clips,
+            desired_speed_mps=speed_mps,
+            direction_window_frames=pre_skill_config.approach_direction_window_frames,
+        )
+        steering_clip = clips[int(database.clip_indices[steering_skill_index])]
+        steering_clip_name = steering_clip.name
+        steering_source_frame = int(database.frame_indices[steering_skill_index])
+
         query_feature = _build_query_from_output(
             output_qpos=output_qpos,
             kinematics=kinematics,
@@ -824,7 +884,8 @@ def _generate_single_trajectory(
         },
         "command": {
             "speed_mps": speed_mps,
-            "heading_deg": heading_deg,
+            "initial_heading_deg": heading_deg,
+            "approach_command_local_xy": [float(value) for value in approach_command.tolist()],
             "pre_skill_distance_meters": pre_skill_distance_meters,
             "pre_skill_seconds": pre_skill_seconds,
             "pre_skill_frames": pre_skill_frames,
@@ -833,6 +894,10 @@ def _generate_single_trajectory(
         "approach": {
             "target_source_frame": skill_frame,
             "target_clip_name": skill_clip.name,
+            "steering_mode": "skill_entry_direction",
+            "steering_window_frames": int(pre_skill_config.approach_direction_window_frames),
+            "last_steering_clip_name": steering_clip_name,
+            "last_steering_source_frame": steering_source_frame,
         },
         "search": {
             "interval_frames": search_interval_frames,
@@ -964,6 +1029,7 @@ def main() -> None:
                 "min": float(pre_skill_config.start_distance_min_meters),
                 "max": float(pre_skill_config.start_distance_max_meters),
             },
+            "approach_direction_window_frames": int(pre_skill_config.approach_direction_window_frames),
         },
         "start_pose_config": {
             "standing_window_radius_frames": int(start_pose_config.standing_window_radius_frames),
