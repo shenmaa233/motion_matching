@@ -24,6 +24,8 @@
 ## 相关文档
 - `docs/approach_steering_fix.md`
   记录 pre-skill 阶段“先绕大圈再接 obstacle”的问题分析、steering 修复方案和参数含义。
+- `docs/skill_transition_smoothing_fix.md`
+  记录 `locomotion -> skill` 接入处突变的原因分析，以及 skill entry 连续性代价和 root 平滑修复方案。
 
 ## 当前默认假设
 - 单技能只启用 `climb_15_z_scale_1.0`。

@@ -25,6 +25,8 @@ from motion_matching_common import (
     load_motion_clip,
     mirror_motion_clip,
     normalize_features,
+    quaternion_from_yaw,
+    quaternion_multiply,
     quaternion_to_yaw,
     resolve_repo_path,
     sanitize_skill_name,
@@ -211,6 +213,25 @@ def _build_query_from_output(
     )
 
 
+def _runtime_pose_state_from_output(
+    *,
+    output_qpos: list[np.ndarray],
+    kinematics: KinematicsHelper,
+    dt: float,
+) -> dict[str, np.ndarray]:
+    current_qpos = output_qpos[-1]
+    previous_qpos = output_qpos[-2] if len(output_qpos) >= 2 else None
+    return kinematics.runtime_pose_features(current_qpos, previous_qpos, dt)
+
+
+def _current_root_yaw_rate_from_output(output_qpos: list[np.ndarray], dt: float) -> float:
+    if len(output_qpos) < 2:
+        return 0.0
+    current_yaw = float(quaternion_to_yaw(np.asarray(output_qpos[-1][:4], dtype=np.float64)))
+    previous_yaw = float(quaternion_to_yaw(np.asarray(output_qpos[-2][:4], dtype=np.float64)))
+    return float(wrap_angle(current_yaw - previous_yaw) / max(dt, 1e-6))
+
+
 def _build_query_from_pose(
     *,
     current_qpos: np.ndarray,
@@ -359,11 +380,13 @@ def _append_clip_chunk(
     dt: float,
     inertialization_damping: float,
     align_to_previous_root: bool = True,
+    root_blend_frames: int = 0,
 ) -> np.ndarray:
     if desired_new_frames <= 0:
         return np.zeros((0, clip.qpos.shape[1]), dtype=np.float64)
 
     previous_qpos = output_qpos[-1] if output_qpos else None
+    pre_previous_qpos = output_qpos[-2] if len(output_qpos) >= 2 else None
     if previous_qpos is None:
         source_end_frame = min(clip.num_frames, source_start_frame + desired_new_frames)
         source_segment = clip.qpos[source_start_frame:source_end_frame]
@@ -382,6 +405,14 @@ def _append_clip_chunk(
                 dt,
                 inertialization_damping,
                 preserve_root_pose=True,
+            )
+        if root_blend_frames > 0:
+            transitioned = _smooth_root_transition(
+                transitioned,
+                previous_qpos=previous_qpos,
+                pre_previous_qpos=pre_previous_qpos,
+                dt=dt,
+                blend_frames=root_blend_frames,
             )
         appended = transitioned[1:]
 
@@ -483,6 +514,8 @@ def _select_skill_entry_index(
     skill_metadata: dict[str, Any],
     database: DatabaseBundle,
     clips: list[MotionClip],
+    current_root_local_velocity_xy: np.ndarray | None = None,
+    current_root_yaw_rate: float | None = None,
 ) -> int:
     skill_start_frame = int(skill_metadata["skill_start_frame"])
     skill_end_frame = int(skill_metadata["skill_end_frame"])
@@ -494,8 +527,30 @@ def _select_skill_entry_index(
         allow_mirrored=allow_mirrored_skill,
     )
 
-    distances = np.linalg.norm(database.normalized_features[entry_candidates] - query_feature[None, :], axis=1)
-    ranked_indices = entry_candidates[np.argsort(distances)]
+    feature_distances = np.linalg.norm(database.normalized_features[entry_candidates] - query_feature[None, :], axis=1)
+    total_costs = feature_distances.astype(np.float64)
+    if current_root_local_velocity_xy is not None:
+        candidate_velocity_costs = np.zeros_like(total_costs)
+        candidate_yaw_rate_costs = np.zeros_like(total_costs)
+        current_root_local_velocity_xy = np.asarray(current_root_local_velocity_xy, dtype=np.float64)
+        reference_yaw_rate = 0.0 if current_root_yaw_rate is None else float(current_root_yaw_rate)
+        for candidate_offset, database_index in enumerate(entry_candidates):
+            clip_index = int(database.clip_indices[database_index])
+            frame_index = int(database.frame_indices[database_index])
+            clip = clips[clip_index]
+            candidate_root_yaw = float(quaternion_to_yaw(clip.qpos[frame_index, :4]))
+            candidate_root_local_velocity = world_to_local_vector(
+                clip.body_lin_vel_w[frame_index, 0],
+                candidate_root_yaw,
+            )[:2]
+            candidate_yaw_rate = float(clip.body_ang_vel_w[frame_index, 0, 2])
+            candidate_velocity_costs[candidate_offset] = float(
+                np.linalg.norm(candidate_root_local_velocity - current_root_local_velocity_xy)
+            )
+            candidate_yaw_rate_costs[candidate_offset] = abs(candidate_yaw_rate - reference_yaw_rate)
+        total_costs = total_costs + 0.75 * candidate_velocity_costs + 0.2 * candidate_yaw_rate_costs
+
+    ranked_indices = entry_candidates[np.argsort(total_costs)]
     for database_index in ranked_indices:
         clip_index = int(database.clip_indices[database_index])
         frame_index = int(database.frame_indices[database_index])
@@ -508,6 +563,49 @@ def _select_skill_entry_index(
             return int(database_index)
 
     return int(ranked_indices[0])
+
+
+def _smooth_root_transition(
+    transitioned_qpos: np.ndarray,
+    *,
+    previous_qpos: np.ndarray,
+    pre_previous_qpos: np.ndarray | None,
+    dt: float,
+    blend_frames: int,
+) -> np.ndarray:
+    corrected = np.asarray(transitioned_qpos, dtype=np.float64).copy()
+    if corrected.shape[0] <= 1 or blend_frames <= 0:
+        return corrected
+
+    blend_count = min(int(blend_frames), corrected.shape[0] - 1)
+    previous_root_pos = np.asarray(previous_qpos[4:7], dtype=np.float64)
+    previous_root_yaw = float(quaternion_to_yaw(previous_qpos[:4]))
+    if pre_previous_qpos is None:
+        previous_root_velocity = np.zeros(3, dtype=np.float64)
+        previous_yaw_rate = 0.0
+    else:
+        pre_previous_root_pos = np.asarray(pre_previous_qpos[4:7], dtype=np.float64)
+        previous_root_velocity = (previous_root_pos - pre_previous_root_pos) / max(dt, 1e-6)
+        pre_previous_yaw = float(quaternion_to_yaw(pre_previous_qpos[:4]))
+        previous_yaw_rate = float(wrap_angle(previous_root_yaw - pre_previous_yaw) / max(dt, 1e-6))
+
+    for frame_index in range(1, blend_count + 1):
+        normalized_time = frame_index / float(blend_count + 1)
+        alpha = normalized_time * normalized_time * (3.0 - 2.0 * normalized_time)
+        extrapolated_root_pos = previous_root_pos + previous_root_velocity * (frame_index * dt)
+        corrected[frame_index, 4:7] = (
+            (1.0 - alpha) * extrapolated_root_pos + alpha * corrected[frame_index, 4:7]
+        )
+
+        extrapolated_yaw = previous_root_yaw + previous_yaw_rate * (frame_index * dt)
+        target_yaw = float(quaternion_to_yaw(corrected[frame_index, :4]))
+        blended_yaw = float(extrapolated_yaw + alpha * wrap_angle(target_yaw - extrapolated_yaw))
+        yaw_delta = float(wrap_angle(blended_yaw - target_yaw))
+        corrected[frame_index, :4] = quaternion_multiply(
+            quaternion_from_yaw(yaw_delta),
+            corrected[frame_index, :4],
+        )
+    return corrected
 
 
 def _approach_command_from_skill_entry_candidate(
@@ -666,6 +764,7 @@ def _generate_single_trajectory(
     skill_command = np.asarray([speed_mps, 0.0], dtype=np.float64)
     steering_clip_name: str | None = None
     steering_source_frame: int | None = None
+    skill_transition_root_blend_frames = max(6, search_interval_frames)
 
     output_qpos: list[np.ndarray] = []
     segments: list[dict[str, Any]] = []
@@ -701,6 +800,11 @@ def _generate_single_trajectory(
 
     while (len(output_qpos) - 1) < pre_skill_frames:
         remaining_frames = pre_skill_frames - (len(output_qpos) - 1)
+        pose_state = _runtime_pose_state_from_output(
+            output_qpos=output_qpos,
+            kinematics=kinematics,
+            dt=dt,
+        )
         steering_query = _build_query_from_output(
             output_qpos=output_qpos,
             kinematics=kinematics,
@@ -714,6 +818,8 @@ def _generate_single_trajectory(
             skill_metadata=skill_metadata,
             database=database,
             clips=clips,
+            current_root_local_velocity_xy=pose_state["root_local_velocity"][:2],
+            current_root_yaw_rate=_current_root_yaw_rate_from_output(output_qpos, dt),
         )
         approach_command = _approach_command_from_skill_entry_candidate(
             database_index=steering_skill_index,
@@ -764,6 +870,11 @@ def _generate_single_trajectory(
             )
         )
 
+    skill_pose_state = _runtime_pose_state_from_output(
+        output_qpos=output_qpos,
+        kinematics=kinematics,
+        dt=dt,
+    )
     skill_query = _build_query_from_output(
         output_qpos=output_qpos,
         kinematics=kinematics,
@@ -777,6 +888,8 @@ def _generate_single_trajectory(
         skill_metadata=skill_metadata,
         database=database,
         clips=clips,
+        current_root_local_velocity_xy=skill_pose_state["root_local_velocity"][:2],
+        current_root_yaw_rate=_current_root_yaw_rate_from_output(output_qpos, dt),
     )
     skill_clip = clips[int(database.clip_indices[skill_database_index])]
     skill_frame = int(database.frame_indices[skill_database_index])
@@ -789,6 +902,7 @@ def _generate_single_trajectory(
         desired_new_frames=max(0, skill_end_frame - skill_frame),
         dt=dt,
         inertialization_damping=inertialization_damping,
+        root_blend_frames=skill_transition_root_blend_frames,
     )
     segments.append(
         _segment_record(
@@ -903,6 +1017,7 @@ def _generate_single_trajectory(
             "interval_frames": search_interval_frames,
             "command_spring_damping": command_spring_damping,
             "inertialization_damping": inertialization_damping,
+            "skill_transition_root_blend_frames": int(skill_transition_root_blend_frames),
         },
         "segments": segments,
     }
