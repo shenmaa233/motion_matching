@@ -159,6 +159,52 @@ def _find_skill_metadata(manifest: dict[str, Any], skill_name: str) -> dict[str,
     raise KeyError(f"数据库中没有技能 {skill_name}，可选值: {available}")
 
 
+def _skill_allows_mirrored_candidates(skill_metadata: dict[str, Any]) -> bool:
+    for key in ("allow_mirrored_skill", "allow_mirrored", "allow_mirror"):
+        if key in skill_metadata:
+            return bool(skill_metadata[key])
+    return not bool(skill_metadata.get("terrain_path"))
+
+
+def _sort_skill_names_by_scale(skill_names: list[str]) -> list[str]:
+    def scale_key(skill_name: str) -> tuple[int, float, str]:
+        marker = "_z_scale_"
+        if marker not in skill_name:
+            return (1, 0.0, skill_name)
+        prefix, scale_text = skill_name.split(marker, maxsplit=1)
+        try:
+            scale_value = float(scale_text)
+        except ValueError:
+            return (1, 0.0, skill_name)
+        return (0, scale_value, prefix)
+
+    return sorted(skill_names, key=scale_key)
+
+
+def _resolve_target_skill_names(
+    manifest: dict[str, Any],
+    *,
+    skill_name: str | None,
+    skill_prefix: str | None,
+    all_scales: bool,
+) -> list[str]:
+    available = [str(skill["skill_name"]) for skill in manifest["skills"]]
+
+    if all_scales:
+        if not skill_prefix:
+            raise ValueError("--all-scales 需要与 --skill-prefix 一起使用")
+        matched = [name for name in available if name.startswith(f"{skill_prefix}_z_scale_")]
+        if not matched:
+            raise KeyError(f"数据库中没有前缀为 {skill_prefix} 的 scale 技能，可选值: {available}")
+        return _sort_skill_names_by_scale(matched)
+
+    if skill_prefix is not None:
+        raise ValueError("仅在使用 --all-scales 时才允许传入 --skill-prefix")
+    if skill_name is None:
+        raise ValueError("未指定技能，请传入 --skill-name，或使用 --skill-prefix 配合 --all-scales")
+    return [skill_name]
+
+
 def _select_candidate_index(
     *,
     query_feature: np.ndarray,
@@ -353,7 +399,7 @@ def _skill_entry_target_root_height(
     skill_metadata: dict[str, Any],
 ) -> float:
     skill_start_frame = int(skill_metadata["skill_start_frame"])
-    allow_mirrored_skill = skill_metadata.get("terrain_root_offset") is None
+    allow_mirrored_skill = _skill_allows_mirrored_candidates(skill_metadata)
     exact_frame_candidates = _skill_start_candidate_indices(
         database=database,
         clips=clips,
@@ -490,7 +536,7 @@ def _select_skill_start_index(
 ) -> int:
     skill_start_frame = int(skill_metadata["skill_start_frame"])
     skill_end_frame = int(skill_metadata["skill_end_frame"])
-    allow_mirrored_skill = skill_metadata.get("terrain_root_offset") is None
+    allow_mirrored_skill = _skill_allows_mirrored_candidates(skill_metadata)
     exact_frame_candidates = _skill_start_candidate_indices(
         database=database,
         clips=clips,
@@ -519,7 +565,7 @@ def _select_skill_entry_index(
 ) -> int:
     skill_start_frame = int(skill_metadata["skill_start_frame"])
     skill_end_frame = int(skill_metadata["skill_end_frame"])
-    allow_mirrored_skill = skill_metadata.get("terrain_root_offset") is None
+    allow_mirrored_skill = _skill_allows_mirrored_candidates(skill_metadata)
     entry_candidates = _skill_entry_candidate_indices(
         database=database,
         clips=clips,
@@ -735,6 +781,22 @@ def _terrain_pose_from_fixed_skill(
     )
 
 
+def _skill_anchor_frame_for_terrain(
+    *,
+    source_start_frame: int,
+    skill_start_frame: int,
+    num_appended_frames: int,
+) -> tuple[int, int | None]:
+    if num_appended_frames <= 0:
+        return int(source_start_frame), None
+
+    first_appended_source_frame = int(source_start_frame) + 1
+    last_appended_source_frame = first_appended_source_frame + int(num_appended_frames) - 1
+    anchor_source_frame = int(np.clip(skill_start_frame, first_appended_source_frame, last_appended_source_frame))
+    output_offset = anchor_source_frame - first_appended_source_frame
+    return anchor_source_frame, output_offset
+
+
 def _generate_single_trajectory(
     *,
     database: DatabaseBundle,
@@ -893,6 +955,7 @@ def _generate_single_trajectory(
     )
     skill_clip = clips[int(database.clip_indices[skill_database_index])]
     skill_frame = int(database.frame_indices[skill_database_index])
+    skill_start_frame = int(skill_metadata["skill_start_frame"])
     skill_end_frame = int(skill_metadata["skill_end_frame"])
     skill_output_start = len(output_qpos)
     skill_appended = _append_clip_chunk(
@@ -913,12 +976,18 @@ def _generate_single_trajectory(
             output_start_frame=skill_output_start,
         )
     )
-    skill_output_source_frame = min(skill_frame + 1, skill_clip.num_frames - 1)
-    if len(skill_appended) > 0:
-        skill_anchor_qpos = np.asarray(output_qpos[skill_output_start], dtype=np.float64)
+    skill_output_source_frame, skill_anchor_output_offset = _skill_anchor_frame_for_terrain(
+        source_start_frame=skill_frame,
+        skill_start_frame=skill_start_frame,
+        num_appended_frames=len(skill_appended),
+    )
+    if skill_anchor_output_offset is not None:
+        skill_anchor_qpos = np.asarray(
+            output_qpos[skill_output_start + skill_anchor_output_offset],
+            dtype=np.float64,
+        )
     else:
         skill_anchor_qpos = np.asarray(output_qpos[-1], dtype=np.float64)
-        skill_output_source_frame = int(skill_frame)
     terrain_world_pose = _terrain_pose_from_skill_asset_reference(
         current_root_qpos=skill_anchor_qpos,
         skill_clip=skill_clip,
@@ -989,12 +1058,19 @@ def _generate_single_trajectory(
             "entry_source_frame": int(skill_frame),
             "source_frame": int(skill_output_source_frame),
             "mirrored": bool(skill_clip.mirrored),
+            "mirroring_allowed": bool(_skill_allows_mirrored_candidates(skill_metadata)),
             "root_translation": [float(value) for value in skill_clip.qpos[skill_output_source_frame, 4:7].tolist()],
             "root_yaw_deg": float(np.rad2deg(quaternion_to_yaw(skill_clip.qpos[skill_output_source_frame, :4]))),
         },
         "terrain_anchor": {
             "applied_source_frame": int(skill_output_source_frame),
+            "applied_output_frame": (
+                None
+                if skill_anchor_output_offset is None
+                else int(skill_output_start + skill_anchor_output_offset)
+            ),
             "interpreted_as": "terrain_asset_origin_in_skill_clip_world",
+            "anchor_policy": "skill_start_frame",
         },
         "command": {
             "speed_mps": speed_mps,
@@ -1035,8 +1111,19 @@ def main() -> None:
     parser.add_argument(
         "--skill-name",
         type=str,
-        default="climb_15_z_scale_1.0",
+        default=None,
         help="要生成的技能名。",
+    )
+    parser.add_argument(
+        "--skill-prefix",
+        type=str,
+        default=None,
+        help="技能前缀，例如 climb_15。配合 --all-scales 批量生成该前缀下的所有 z_scale。",
+    )
+    parser.add_argument(
+        "--all-scales",
+        action="store_true",
+        help="按 --skill-prefix 匹配所有 z_scale 技能并批量生成。",
     )
     parser.add_argument(
         "--num-trajectories",
@@ -1047,8 +1134,8 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("output/motion_matching/generated/climb_15_z_scale_1.0"),
-        help="轨迹输出目录。",
+        default=None,
+        help="轨迹输出目录。单技能模式下默认是 output/motion_matching/generated/<skill_name>。",
     )
     parser.add_argument(
         "--seed",
@@ -1088,74 +1175,97 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    default_single_skill = "climb_15_z_scale_1.0"
+    effective_skill_name = args.skill_name
+    if effective_skill_name is None and not args.all_scales:
+        effective_skill_name = default_single_skill
+
     database = _load_database_bundle(args.database_dir)
     clips = _load_clip_catalog(database.manifest)
-    skill_metadata = _find_skill_metadata(database.manifest, args.skill_name)
     pre_skill_config = _load_pre_skill_config(args.generation_config)
     start_pose_config = _load_start_pose_config(args.generation_config)
-    output_dir = resolve_repo_path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    rng = np.random.default_rng(args.seed)
+    target_skill_names = _resolve_target_skill_names(
+        database.manifest,
+        skill_name=effective_skill_name,
+        skill_prefix=args.skill_prefix,
+        all_scales=args.all_scales,
+    )
     kinematics = KinematicsHelper()
     post_skill_frames = max(1, int(round(float(args.post_skill_seconds) * clips[0].fps)))
 
-    trajectory_manifests: list[dict[str, Any]] = []
-    for trajectory_index in range(args.num_trajectories):
-        qpos_trajectory, trajectory_manifest = _generate_single_trajectory(
-            database=database,
-            clips=clips,
-            skill_metadata=skill_metadata,
-            rng=rng,
-            pre_skill_config=pre_skill_config,
-            start_pose_config=start_pose_config,
-            search_interval_frames=args.search_interval_frames,
-            command_spring_damping=args.command_spring_damping,
-            inertialization_damping=args.inertialization_damping,
-            post_skill_frames=post_skill_frames,
-            kinematics=kinematics,
-        )
+    for skill_offset, target_skill_name in enumerate(target_skill_names):
+        skill_metadata = _find_skill_metadata(database.manifest, target_skill_name)
+        if args.output_dir is None:
+            output_dir = resolve_repo_path(Path("output/motion_matching/generated") / target_skill_name)
+        elif args.all_scales:
+            output_dir = resolve_repo_path(args.output_dir) / target_skill_name
+        else:
+            output_dir = resolve_repo_path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        trajectory_name = f"{sanitize_skill_name(args.skill_name)}_{trajectory_index:04d}"
-        trajectory_path = output_dir / f"{trajectory_name}.npz"
-        export_qpos_trajectory_to_beyond_mimic(
-            qpos_trajectory,
-            clips[0].fps,
-            trajectory_path,
-            kinematics=kinematics,
-        )
-        trajectory_manifest["trajectory_name"] = trajectory_name
-        trajectory_manifest["trajectory_path"] = str(trajectory_path.relative_to(resolve_repo_path(".")))
-        trajectory_manifest["num_frames"] = int(qpos_trajectory.shape[0])
-        trajectory_manifests.append(trajectory_manifest)
-        print(f"[ok] 已生成 {trajectory_path}")
+        skill_seed = args.seed + skill_offset
+        rng = np.random.default_rng(skill_seed)
+        trajectory_manifests: list[dict[str, Any]] = []
+        for trajectory_index in range(args.num_trajectories):
+            qpos_trajectory, trajectory_manifest = _generate_single_trajectory(
+                database=database,
+                clips=clips,
+                skill_metadata=skill_metadata,
+                rng=rng,
+                pre_skill_config=pre_skill_config,
+                start_pose_config=start_pose_config,
+                search_interval_frames=args.search_interval_frames,
+                command_spring_damping=args.command_spring_damping,
+                inertialization_damping=args.inertialization_damping,
+                post_skill_frames=post_skill_frames,
+                kinematics=kinematics,
+            )
 
-    batch_manifest = {
-        "version": 1,
-        "database_dir": str(resolve_repo_path(args.database_dir).relative_to(resolve_repo_path("."))),
-        "skill_name": args.skill_name,
-        "num_trajectories": args.num_trajectories,
-        "seed": args.seed,
-        "generation_config_path": str(resolve_repo_path(args.generation_config).relative_to(resolve_repo_path("."))),
-        "pre_skill_config": {
-            "speed_levels_mps": [float(value) for value in pre_skill_config.speed_levels_mps],
-            "heading_degrees": [float(value) for value in pre_skill_config.heading_degrees],
-            "start_distance_meters": {
-                "min": float(pre_skill_config.start_distance_min_meters),
-                "max": float(pre_skill_config.start_distance_max_meters),
+            trajectory_name = f"{sanitize_skill_name(target_skill_name)}_{trajectory_index:04d}"
+            trajectory_path = output_dir / f"{trajectory_name}.npz"
+            export_qpos_trajectory_to_beyond_mimic(
+                qpos_trajectory,
+                clips[0].fps,
+                trajectory_path,
+                kinematics=kinematics,
+            )
+            trajectory_manifest["trajectory_name"] = trajectory_name
+            trajectory_manifest["trajectory_path"] = str(trajectory_path.relative_to(resolve_repo_path(".")))
+            trajectory_manifest["num_frames"] = int(qpos_trajectory.shape[0])
+            trajectory_manifests.append(trajectory_manifest)
+            print(f"[ok] 已生成 {trajectory_path}")
+
+        batch_manifest = {
+            "version": 1,
+            "database_dir": str(resolve_repo_path(args.database_dir).relative_to(resolve_repo_path("."))),
+            "skill_name": target_skill_name,
+            "skill_prefix": args.skill_prefix,
+            "all_scales": bool(args.all_scales),
+            "num_trajectories": args.num_trajectories,
+            "seed": skill_seed,
+            "generation_config_path": str(resolve_repo_path(args.generation_config).relative_to(resolve_repo_path("."))),
+            "pre_skill_config": {
+                "speed_levels_mps": [float(value) for value in pre_skill_config.speed_levels_mps],
+                "heading_degrees": [float(value) for value in pre_skill_config.heading_degrees],
+                "start_distance_meters": {
+                    "min": float(pre_skill_config.start_distance_min_meters),
+                    "max": float(pre_skill_config.start_distance_max_meters),
+                },
+                "approach_direction_window_frames": int(pre_skill_config.approach_direction_window_frames),
             },
-            "approach_direction_window_frames": int(pre_skill_config.approach_direction_window_frames),
-        },
-        "start_pose_config": {
-            "standing_window_radius_frames": int(start_pose_config.standing_window_radius_frames),
-            "force_root_height_alignment": bool(start_pose_config.force_root_height_alignment),
-            "root_height_offset_meters": float(start_pose_config.root_height_offset_meters),
-        },
-        "trajectories": trajectory_manifests,
-    }
-    manifest_path = output_dir / "batch_manifest.json"
-    json_dump(manifest_path, batch_manifest)
-    print(f"[ok] 批量清单已写出到 {manifest_path}")
+            "start_pose_config": {
+                "standing_window_radius_frames": int(start_pose_config.standing_window_radius_frames),
+                "force_root_height_alignment": bool(start_pose_config.force_root_height_alignment),
+                "root_height_offset_meters": float(start_pose_config.root_height_offset_meters),
+            },
+            "trajectories": trajectory_manifests,
+        }
+        manifest_path = output_dir / "batch_manifest.json"
+        json_dump(manifest_path, batch_manifest)
+        print(f"[ok] 批量清单已写出到 {manifest_path}")
+
+    if args.skill_name is None and not args.all_scales:
+        print(f"[info] 未显式指定技能，默认建议使用 --skill-name {default_single_skill}")
 
 
 if __name__ == "__main__":

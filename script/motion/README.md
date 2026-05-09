@@ -38,4 +38,7 @@
 - `pre_skill.approach_direction_window_frames` 用来控制动态 steering 回看
   多长的 skill 入口历史位移，以估计当前 approach 的局部方向。
 - `terrain_root_offset` 目前是启发式占位值，仍然建议人工确认。
-- 左右镜像默认开启。
+- 左右镜像默认会用于 locomotion；带 `terrain_path` 的 skill 检索默认过滤
+  mirrored skill，避免把镜像后的技能和未镜像的 terrain URDF 配在一起。若某个
+  skill 已有对应镜像 terrain 流程，可在技能元数据里显式设置
+  `allow_mirrored_skill`。

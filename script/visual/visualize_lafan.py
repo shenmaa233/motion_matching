@@ -70,6 +70,9 @@ def create_plant(robot_model_path: str, object_model_path: str | list[str] | Non
     )
     plant.Finalize()
     meshcat = StartMeshcat()
+    meshcat_url = meshcat.web_url() if hasattr(meshcat, "web_url") else None
+    if meshcat_url:
+        print(f"Meshcat URL: {meshcat_url}")
     vis = MeshcatVisualizer.AddToBuilder(builder, scene_graph, meshcat)
     diagram = builder.Build()
     return plant, vis, diagram
@@ -88,6 +91,34 @@ def draw_q_knots(vis, plant, diagram, q_knots, dt):
         vis.ForcedPublish(vis_context)
     vis.StopRecording()
     vis.PublishRecording()
+
+
+def step_q_knots(vis, plant, diagram, q_knots, dt, start_frame: int = 0):
+    context = diagram.CreateDefaultContext()
+    plant_context = plant.GetMyMutableContextFromRoot(context)
+    vis_context = vis.GetMyMutableContextFromRoot(context)
+    frame_index = int(np.clip(start_frame, 0, max(len(q_knots) - 1, 0)))
+
+    while True:
+        context.SetTime(frame_index * dt)
+        plant.SetPositions(plant_context, q_knots[frame_index])
+        vis.ForcedPublish(vis_context)
+        command = input(
+            f"frame {frame_index}/{len(q_knots) - 1}, "
+            f"t={frame_index * dt:.3f}s | Enter=next, b=prev, number=jump, q=quit: "
+        ).strip()
+        if command.lower() in {"q", "quit", "exit"}:
+            break
+        if command.lower() in {"b", "back", "prev"}:
+            frame_index = max(0, frame_index - 1)
+            continue
+        if command:
+            try:
+                frame_index = int(np.clip(int(command), 0, len(q_knots) - 1))
+            except ValueError:
+                print(f"Unknown command: {command}")
+            continue
+        frame_index = min(len(q_knots) - 1, frame_index + 1)
 
 
 def _natural_sort_key(text: str):
@@ -262,6 +293,8 @@ def visualize_lafan(
     terrain: bool = False,
     terrain_model_dir: str = DEFAULT_TERRAIN_MODEL_DIR,
     recenter: bool = True,
+    step: bool = False,
+    start_frame: int = 0,
 ):
     lafan_files = find_files(base_path, filter=filter)
     generated_trajectory_index = _load_generated_trajectory_index(base_path)
@@ -285,7 +318,10 @@ def visualize_lafan(
             if terrain_model_path is not None:
                 terrain_model_path = _write_transformed_terrain_urdf(terrain_model_path, terrain_world_pose)
             plant, vis, diagram = create_plant(ROBOT_SPHERE_HAND_PATH, terrain_model_path)
-            draw_q_knots(vis, plant, diagram, q_knots, 1.0 / fps)
+            if step:
+                step_q_knots(vis, plant, diagram, q_knots, 1.0 / fps, start_frame=start_frame)
+            else:
+                draw_q_knots(vis, plant, diagram, q_knots, 1.0 / fps)
             input()
     else:
         plant, vis, diagram = create_plant(ROBOT_FAKE_HAND_PATH)
@@ -296,7 +332,10 @@ def visualize_lafan(
             q_knots = extract_q_knots(data)
             if recenter:
                 q_knots, _ = _apply_visual_recenter(q_knots, None)
-            draw_q_knots(vis, plant, diagram, q_knots, 1.0 / fps)
+            if step:
+                step_q_knots(vis, plant, diagram, q_knots, 1.0 / fps, start_frame=start_frame)
+            else:
+                draw_q_knots(vis, plant, diagram, q_knots, 1.0 / fps)
             input()
 
 
@@ -330,6 +369,17 @@ if __name__ == "__main__":
         action="store_true",
         help="关闭可视化归一化；默认会把 terrain 平移到世界中心附近，若没有 terrain 则回到第一帧 root 附近。",
     )
+    parser.add_argument(
+        "--step",
+        action="store_true",
+        help="逐帧查看并在终端显示 frame index。",
+    )
+    parser.add_argument(
+        "--start-frame",
+        type=int,
+        default=0,
+        help="逐帧模式的初始帧号。",
+    )
     args = parser.parse_args()
     visualize_lafan(
         base_path=args.input_dir,
@@ -337,4 +387,6 @@ if __name__ == "__main__":
         terrain=args.terrain,
         terrain_model_dir=args.terrain_model_dir,
         recenter=not args.no_recenter,
+        step=args.step,
+        start_frame=args.start_frame,
     )
