@@ -168,6 +168,9 @@ def _resolve_root_index(data: np.lib.npyio.NpzFile) -> int:
 
 
 def extract_q_knots(data: np.lib.npyio.NpzFile) -> np.ndarray:
+    if "qpos" in data:
+        return np.asarray(data["qpos"], dtype=np.float64)
+
     _, joint_positions = _load_array(
         data,
         "joint positions",

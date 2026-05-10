@@ -232,6 +232,63 @@ def _select_candidate_index(
     return int(ranked_indices[0])
 
 
+def _select_locomotion_approach_index(
+    *,
+    query_feature: np.ndarray,
+    command_local_velocity_xy: np.ndarray,
+    database: DatabaseBundle,
+    clips: list[MotionClip],
+    minimum_future_frames: int,
+) -> int:
+    candidate_indices = database.locomotion_database_indices
+    if len(candidate_indices) == 0:
+        raise ValueError("locomotion 候选集合为空")
+
+    feature_distances = np.linalg.norm(
+        database.normalized_features[candidate_indices] - query_feature[None, :],
+        axis=1,
+    ).astype(np.float64)
+    command_local_velocity_xy = np.asarray(command_local_velocity_xy, dtype=np.float64)
+    command_speed = float(np.linalg.norm(command_local_velocity_xy))
+
+    total_costs = feature_distances.copy()
+    for candidate_offset, database_index in enumerate(candidate_indices):
+        clip_index = int(database.clip_indices[int(database_index)])
+        frame_index = int(database.frame_indices[int(database_index)])
+        clip = clips[clip_index]
+        root_yaw = float(quaternion_to_yaw(clip.qpos[frame_index, :4]))
+        candidate_local_velocity = world_to_local_vector(
+            clip.body_lin_vel_w[frame_index, 0],
+            root_yaw,
+        )[:2]
+        candidate_speed = float(np.linalg.norm(candidate_local_velocity))
+        if command_speed > 1e-6 and candidate_speed > 1e-6:
+            direction_cost = 1.0 - float(
+                np.clip(
+                    np.dot(candidate_local_velocity, command_local_velocity_xy)
+                    / (candidate_speed * command_speed),
+                    -1.0,
+                    1.0,
+                )
+            )
+        else:
+            direction_cost = 0.0
+        speed_cost = abs(candidate_speed - command_speed)
+        yaw_rate_cost = abs(float(clip.body_ang_vel_w[frame_index, 0, 2]))
+        total_costs[candidate_offset] += 1.25 * direction_cost + 0.35 * speed_cost + 0.35 * yaw_rate_cost
+
+    ranked_indices = candidate_indices[np.argsort(total_costs)]
+    for database_index in ranked_indices:
+        clip_index = int(database.clip_indices[int(database_index)])
+        frame_index = int(database.frame_indices[int(database_index)])
+        clip = clips[clip_index]
+        available_future_frames = clip.num_frames - frame_index - 1
+        if available_future_frames >= minimum_future_frames:
+            return int(database_index)
+
+    return int(ranked_indices[0])
+
+
 def _command_vector_local(speed_mps: float, heading_deg: float) -> np.ndarray:
     heading_rad = np.deg2rad(float(heading_deg))
     return np.asarray([speed_mps * np.cos(heading_rad), speed_mps * np.sin(heading_rad)], dtype=np.float64)
@@ -562,6 +619,7 @@ def _select_skill_entry_index(
     clips: list[MotionClip],
     current_root_local_velocity_xy: np.ndarray | None = None,
     current_root_yaw_rate: float | None = None,
+    latest_entry_frame: int | None = None,
 ) -> int:
     skill_start_frame = int(skill_metadata["skill_start_frame"])
     skill_end_frame = int(skill_metadata["skill_end_frame"])
@@ -572,6 +630,11 @@ def _select_skill_entry_index(
         skill_name=skill_metadata["skill_name"],
         allow_mirrored=allow_mirrored_skill,
     )
+    if latest_entry_frame is not None:
+        candidate_frame_indices = database.frame_indices[entry_candidates]
+        settled_entry_candidates = entry_candidates[candidate_frame_indices <= int(latest_entry_frame)]
+        if len(settled_entry_candidates) > 0:
+            entry_candidates = settled_entry_candidates
 
     feature_distances = np.linalg.norm(database.normalized_features[entry_candidates] - query_feature[None, :], axis=1)
     total_costs = feature_distances.astype(np.float64)
@@ -827,6 +890,7 @@ def _generate_single_trajectory(
     steering_clip_name: str | None = None
     steering_source_frame: int | None = None
     skill_transition_root_blend_frames = max(6, search_interval_frames)
+    skill_entry_settle_frames = max(6, search_interval_frames)
 
     output_qpos: list[np.ndarray] = []
     segments: list[dict[str, Any]] = []
@@ -902,9 +966,9 @@ def _generate_single_trajectory(
             database=database,
             command_spring_damping=command_spring_damping,
         )
-        database_index = _select_candidate_index(
+        database_index = _select_locomotion_approach_index(
             query_feature=query_feature,
-            candidate_indices=database.locomotion_database_indices,
+            command_local_velocity_xy=approach_command,
             database=database,
             clips=clips,
             minimum_future_frames=1,
@@ -937,6 +1001,7 @@ def _generate_single_trajectory(
         kinematics=kinematics,
         dt=dt,
     )
+    skill_start_frame = int(skill_metadata["skill_start_frame"])
     skill_query = _build_query_from_output(
         output_qpos=output_qpos,
         kinematics=kinematics,
@@ -952,10 +1017,10 @@ def _generate_single_trajectory(
         clips=clips,
         current_root_local_velocity_xy=skill_pose_state["root_local_velocity"][:2],
         current_root_yaw_rate=_current_root_yaw_rate_from_output(output_qpos, dt),
+        latest_entry_frame=max(0, skill_start_frame - skill_entry_settle_frames),
     )
     skill_clip = clips[int(database.clip_indices[skill_database_index])]
     skill_frame = int(database.frame_indices[skill_database_index])
-    skill_start_frame = int(skill_metadata["skill_start_frame"])
     skill_end_frame = int(skill_metadata["skill_end_frame"])
     skill_output_start = len(output_qpos)
     skill_appended = _append_clip_chunk(
@@ -1084,7 +1149,7 @@ def _generate_single_trajectory(
         "approach": {
             "target_source_frame": skill_frame,
             "target_clip_name": skill_clip.name,
-            "steering_mode": "skill_entry_direction",
+            "steering_mode": "skill_entry_direction_with_locomotion_alignment",
             "steering_window_frames": int(pre_skill_config.approach_direction_window_frames),
             "last_steering_clip_name": steering_clip_name,
             "last_steering_source_frame": steering_source_frame,
@@ -1094,6 +1159,7 @@ def _generate_single_trajectory(
             "command_spring_damping": command_spring_damping,
             "inertialization_damping": inertialization_damping,
             "skill_transition_root_blend_frames": int(skill_transition_root_blend_frames),
+            "skill_entry_settle_frames": int(skill_entry_settle_frames),
         },
         "segments": segments,
     }
