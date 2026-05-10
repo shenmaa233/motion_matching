@@ -1,0 +1,245 @@
+{
+  "version": 1,
+  "skills": [
+    {
+      "skill_name": "climb_08_z_scale_1.0",
+      "skill_path": "data/skills/climb_08_z_scale_1.0.npz",
+      "terrain_path": "data/models/terrain/climb_08/multi_boxes_z_scale_1.0.urdf",
+      "skill_start_frame": 72,
+      "skill_end_frame": 320,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_09_z_scale_1.0",
+      "skill_path": "data/skills/climb_09_z_scale_1.0.npz",
+      "terrain_path": "data/models/terrain/climb_09/multi_boxes_z_scale_1.0.urdf",
+      "skill_start_frame": 75,
+      "skill_end_frame": 320,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_15_z_scale_0.8",
+      "skill_path": "data/skills/climb_15_z_scale_0.8.npz",
+      "terrain_path": "data/models/terrain/climb_15/multi_boxes_z_scale_0.8.urdf",
+      "skill_start_frame": 50,
+      "skill_end_frame": 140,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_15_z_scale_0.9",
+      "skill_path": "data/skills/climb_15_z_scale_0.9.npz",
+      "terrain_path": "data/models/terrain/climb_15/multi_boxes_z_scale_0.9.urdf",
+      "skill_start_frame": 50,
+      "skill_end_frame": 140,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_15_z_scale_1.0",
+      "skill_path": "data/skills/climb_15_z_scale_1.0.npz",
+      "terrain_path": "data/models/terrain/climb_15/multi_boxes_z_scale_1.0.urdf",
+      "skill_start_frame": 50,
+      "skill_end_frame": 140,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_15_z_scale_1.1",
+      "skill_path": "data/skills/climb_15_z_scale_1.1.npz",
+      "terrain_path": "data/models/terrain/climb_15/multi_boxes_z_scale_1.1.urdf",
+      "skill_start_frame": 50,
+      "skill_end_frame": 140,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_15_z_scale_1.2",
+      "skill_path": "data/skills/climb_15_z_scale_1.2.npz",
+      "terrain_path": "data/models/terrain/climb_15/multi_boxes_z_scale_1.2.urdf",
+      "skill_start_frame": 50,
+      "skill_end_frame": 140,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_16_z_scale_0.8",
+      "skill_path": "data/skills/climb_16_z_scale_0.8.npz",
+      "terrain_path": "data/models/terrain/climb_16/multi_boxes_z_scale_0.8.urdf",
+      "skill_start_frame": 64,
+      "skill_end_frame": 140,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_16_z_scale_0.9",
+      "skill_path": "data/skills/climb_16_z_scale_0.9.npz",
+      "terrain_path": "data/models/terrain/climb_16/multi_boxes_z_scale_0.9.urdf",
+      "skill_start_frame": 64,
+      "skill_end_frame": 140,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_16_z_scale_1.0",
+      "skill_path": "data/skills/climb_16_z_scale_1.0.npz",
+      "terrain_path": "data/models/terrain/climb_16/multi_boxes_z_scale_1.0.urdf",
+      "skill_start_frame": 64,
+      "skill_end_frame": 140,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_16_z_scale_1.1",
+      "skill_path": "data/skills/climb_16_z_scale_1.1.npz",
+      "terrain_path": "data/models/terrain/climb_16/multi_boxes_z_scale_1.1.urdf",
+      "skill_start_frame": 64,
+      "skill_end_frame": 140,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_16_z_scale_1.2",
+      "skill_path": "data/skills/climb_16_z_scale_1.2.npz",
+      "terrain_path": "data/models/terrain/climb_16/multi_boxes_z_scale_1.2.urdf",
+      "skill_start_frame": 64,
+      "skill_end_frame": 140,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_17_z_scale_0.8",
+      "skill_path": "data/skills/climb_17_z_scale_0.8.npz",
+      "terrain_path": "data/models/terrain/climb_17/multi_boxes_z_scale_0.8.urdf",
+      "skill_start_frame": 48,
+      "skill_end_frame": 150,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_17_z_scale_0.9",
+      "skill_path": "data/skills/climb_17_z_scale_0.9.npz",
+      "terrain_path": "data/models/terrain/climb_17/multi_boxes_z_scale_0.9.urdf",
+      "skill_start_frame": 48,
+      "skill_end_frame": 150,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_17_z_scale_1.0",
+      "skill_path": "data/skills/climb_17_z_scale_1.0.npz",
+      "terrain_path": "data/models/terrain/climb_17/multi_boxes_z_scale_1.0.urdf",
+      "skill_start_frame": 48,
+      "skill_end_frame": 150,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_17_z_scale_1.1",
+      "skill_path": "data/skills/climb_17_z_scale_1.1.npz",
+      "terrain_path": "data/models/terrain/climb_17/multi_boxes_z_scale_1.1.urdf",
+      "skill_start_frame": 48,
+      "skill_end_frame": 150,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_17_z_scale_1.2",
+      "skill_path": "data/skills/climb_17_z_scale_1.2.npz",
+      "terrain_path": "data/models/terrain/climb_17/multi_boxes_z_scale_1.2.urdf",
+      "skill_start_frame": 48,
+      "skill_end_frame": 150,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_18_z_scale_0.8",
+      "skill_path": "data/skills/climb_18_z_scale_0.8.npz",
+      "terrain_path": "data/models/terrain/climb_18/multi_boxes_z_scale_0.8.urdf",
+      "skill_start_frame": 68,
+      "skill_end_frame": 115,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_18_z_scale_0.9",
+      "skill_path": "data/skills/climb_18_z_scale_0.9.npz",
+      "terrain_path": "data/models/terrain/climb_18/multi_boxes_z_scale_0.9.urdf",
+      "skill_start_frame": 68,
+      "skill_end_frame": 115,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_18_z_scale_1.0",
+      "skill_path": "data/skills/climb_18_z_scale_1.0.npz",
+      "terrain_path": "data/models/terrain/climb_18/multi_boxes_z_scale_1.0.urdf",
+      "skill_start_frame": 68,
+      "skill_end_frame": 115,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_18_z_scale_1.1",
+      "skill_path": "data/skills/climb_18_z_scale_1.1.npz",
+      "terrain_path": "data/models/terrain/climb_18/multi_boxes_z_scale_1.1.urdf",
+      "skill_start_frame": 68,
+      "skill_end_frame": 115,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_18_z_scale_1.2",
+      "skill_path": "data/skills/climb_18_z_scale_1.2.npz",
+      "terrain_path": "data/models/terrain/climb_18/multi_boxes_z_scale_1.2.urdf",
+      "skill_start_frame": 68,
+      "skill_end_frame": 115,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_20_z_scale_1.0",
+      "skill_path": "data/skills/climb_20_z_scale_1.0.npz",
+      "terrain_path": "data/models/terrain/climb_20/multi_boxes_z_scale_1.0.urdf",
+      "skill_start_frame": 70,
+      "skill_end_frame": 360,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    },
+    {
+      "skill_name": "climb_24_z_scale_1.0",
+      "skill_path": "data/skills/climb_24_z_scale_1.0.npz",
+      "terrain_path": "data/models/terrain/climb_24/multi_boxes_z_scale_1.0.urdf",
+      "skill_start_frame": 60,
+      "skill_end_frame": 313,
+      "entry_window_length": 24,
+      "annotation_source": "heuristic_seed",
+      "needs_review": true
+    }
+  ]
+}
