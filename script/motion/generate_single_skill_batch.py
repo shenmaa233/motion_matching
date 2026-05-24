@@ -11,6 +11,7 @@ import numpy as np
 from motion_matching_common import (
     DEFAULT_COMMAND_SPRING_DAMPING,
     DEFAULT_HEADING_DEGREES,
+    DEFAULT_HORIZONS,
     DEFAULT_INERTIALIZATION_DAMPING,
     DEFAULT_SEARCH_INTERVAL_FRAMES,
     DEFAULT_SPEED_LEVELS,
@@ -33,6 +34,13 @@ from motion_matching_common import (
     wrap_angle,
     world_to_local_vector,
 )
+
+MAX_INITIAL_HEADING_DELTA_DEGREES = 45.0
+MIN_START_DISTANCE_METERS = 2.0
+MIN_TRANSLATION_SPEED_FRACTION = 0.35
+MIN_FORWARD_SPEED_FRACTION = 0.45
+MAX_LATERAL_SPEED_FRACTION = 0.45
+STEERING_QUERY_MAX_HEADING_DEGREES = 45.0
 
 
 @dataclass
@@ -60,6 +68,12 @@ class PreSkillConfig:
     start_distance_min_meters: float
     start_distance_max_meters: float
     approach_direction_window_frames: int
+
+
+@dataclass(frozen=True)
+class TerrainAnchorConfig:
+    translation: tuple[float, float, float]
+    yaw_deg: float
 
 
 def _load_start_pose_config(config_path: Path) -> StartPoseConfig:
@@ -92,13 +106,90 @@ def _load_pre_skill_config(config_path: Path) -> PreSkillConfig:
         raise ValueError(f"{resolved_path} 的 pre_skill.speed_levels_mps 不能为空")
     if len(config.heading_degrees) == 0:
         raise ValueError(f"{resolved_path} 的 pre_skill.heading_degrees 不能为空")
-    if config.start_distance_min_meters < 0.0:
-        raise ValueError(f"{resolved_path} 的 pre_skill.start_distance_meters.min 不能小于 0")
+    if config.start_distance_min_meters < MIN_START_DISTANCE_METERS:
+        raise ValueError(
+            f"{resolved_path} 的 pre_skill.start_distance_meters.min 不能小于 "
+            f"{MIN_START_DISTANCE_METERS:.1f}，否则没有足够距离完成进入 skill 前的方向调整"
+        )
     if config.start_distance_max_meters < config.start_distance_min_meters:
         raise ValueError(f"{resolved_path} 的 pre_skill.start_distance_meters.max 不能小于 min")
     if config.approach_direction_window_frames < 1:
         raise ValueError(f"{resolved_path} 的 pre_skill.approach_direction_window_frames 不能小于 1")
     return config
+
+
+def _load_terrain_anchor_config(config_path: Path) -> TerrainAnchorConfig:
+    resolved_path = resolve_repo_path(config_path)
+    payload = json.loads(resolved_path.read_text(encoding="utf-8"))
+    terrain_payload = payload.get("terrain_anchor", {})
+    translation = tuple(float(value) for value in terrain_payload.get("translation", [0.0, 0.0, 0.0]))
+    if len(translation) != 3:
+        raise ValueError(f"{resolved_path} 的 terrain_anchor.translation 必须是 3 维")
+    return TerrainAnchorConfig(
+        translation=(translation[0], translation[1], translation[2]),
+        yaw_deg=float(terrain_payload.get("yaw_deg", 0.0)),
+    )
+
+
+def _trajectory_frame_count(path: Path) -> int:
+    data = np.load(path, allow_pickle=True)
+    if "qpos" in data:
+        return int(np.asarray(data["qpos"]).shape[0])
+    if "body_pos_w" in data:
+        return int(np.asarray(data["body_pos_w"]).shape[0])
+    if "body_positions" in data:
+        return int(np.asarray(data["body_positions"]).shape[0])
+    first_key = data.files[0]
+    return int(np.asarray(data[first_key]).shape[0])
+
+
+def _load_existing_trajectory_manifests(
+    output_dir: Path,
+    skill_metadata: dict[str, Any],
+    target_skill_name: str,
+    end_index: int,
+) -> list[dict[str, Any]]:
+    manifest_path = output_dir / "batch_manifest.json"
+    existing_by_name: dict[str, dict[str, Any]] = {}
+    if manifest_path.exists():
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for trajectory in payload.get("trajectories", []):
+            trajectory_name = str(trajectory.get("trajectory_name", ""))
+            if trajectory_name:
+                existing_by_name[trajectory_name] = trajectory
+
+    trajectory_manifests: list[dict[str, Any]] = []
+    sanitized_skill_name = sanitize_skill_name(target_skill_name)
+    repo_root = resolve_repo_path(".")
+    for trajectory_index in range(end_index):
+        trajectory_name = f"{sanitized_skill_name}_{trajectory_index:04d}"
+        existing = existing_by_name.get(trajectory_name)
+        if existing is not None:
+            trajectory_manifests.append(existing)
+            continue
+
+        trajectory_path = output_dir / f"{trajectory_name}.npz"
+        if not trajectory_path.exists():
+            continue
+        trajectory_manifests.append(
+            {
+                "skill_name": target_skill_name,
+                "terrain_path": skill_metadata.get("terrain_path"),
+                "trajectory_name": trajectory_name,
+                "trajectory_path": str(trajectory_path.relative_to(repo_root)),
+                "num_frames": _trajectory_frame_count(trajectory_path),
+                "manifest_source": "synthesized_from_existing_file",
+            }
+        )
+    return trajectory_manifests
+
+
+def _count_existing_trajectories(output_dir: Path, target_skill_name: str) -> int:
+    sanitized_skill_name = sanitize_skill_name(target_skill_name)
+    count = 0
+    while (output_dir / f"{sanitized_skill_name}_{count:04d}.npz").exists():
+        count += 1
+    return count
 
 
 def _load_database_bundle(database_dir: Path) -> DatabaseBundle:
@@ -252,30 +343,57 @@ def _select_locomotion_approach_index(
     command_speed = float(np.linalg.norm(command_local_velocity_xy))
 
     total_costs = feature_distances.copy()
-    for candidate_offset, database_index in enumerate(candidate_indices):
-        clip_index = int(database.clip_indices[int(database_index)])
-        frame_index = int(database.frame_indices[int(database_index)])
-        clip = clips[clip_index]
-        root_yaw = float(quaternion_to_yaw(clip.qpos[frame_index, :4]))
-        candidate_local_velocity = world_to_local_vector(
-            clip.body_lin_vel_w[frame_index, 0],
-            root_yaw,
-        )[:2]
-        candidate_speed = float(np.linalg.norm(candidate_local_velocity))
-        if command_speed > 1e-6 and candidate_speed > 1e-6:
-            direction_cost = 1.0 - float(
-                np.clip(
-                    np.dot(candidate_local_velocity, command_local_velocity_xy)
-                    / (candidate_speed * command_speed),
-                    -1.0,
-                    1.0,
-                )
-            )
-        else:
-            direction_cost = 0.0
-        speed_cost = abs(candidate_speed - command_speed)
-        yaw_rate_cost = abs(float(clip.body_ang_vel_w[frame_index, 0, 2]))
-        total_costs[candidate_offset] += 1.25 * direction_cost + 0.35 * speed_cost + 0.35 * yaw_rate_cost
+    candidate_clip_indices = database.clip_indices[candidate_indices]
+    candidate_frame_indices = database.frame_indices[candidate_indices]
+    candidate_local_velocities = np.zeros((len(candidate_indices), 2), dtype=np.float64)
+    candidate_yaw_rates = np.zeros((len(candidate_indices),), dtype=np.float64)
+
+    for clip_index in np.unique(candidate_clip_indices):
+        mask = candidate_clip_indices == clip_index
+        frames = candidate_frame_indices[mask]
+        clip = clips[int(clip_index)]
+        quaternions = clip.qpos[frames, :4]
+        w, x, y, z = np.moveaxis(quaternions, -1, 0)
+        root_yaws = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        world_velocities = clip.body_lin_vel_w[frames, 0, :2]
+        cos_yaw = np.cos(root_yaws)
+        sin_yaw = np.sin(root_yaws)
+        candidate_local_velocities[mask, 0] = world_velocities[:, 0] * cos_yaw + world_velocities[:, 1] * sin_yaw
+        candidate_local_velocities[mask, 1] = -world_velocities[:, 0] * sin_yaw + world_velocities[:, 1] * cos_yaw
+        candidate_yaw_rates[mask] = clip.body_ang_vel_w[frames, 0, 2]
+
+    candidate_speeds = np.linalg.norm(candidate_local_velocities, axis=1)
+    if command_speed > 1e-6:
+        denominator = np.maximum(candidate_speeds * command_speed, 1e-12)
+        direction_similarity = np.sum(candidate_local_velocities * command_local_velocity_xy[None, :], axis=1) / denominator
+        direction_costs = 1.0 - np.clip(direction_similarity, -1.0, 1.0)
+        direction_costs = np.where(candidate_speeds > 1e-6, direction_costs, 0.0)
+    else:
+        direction_costs = np.zeros_like(candidate_speeds)
+    speed_costs = np.abs(candidate_speeds - command_speed)
+    yaw_rate_costs = np.abs(candidate_yaw_rates)
+    if command_speed > 1e-6:
+        minimum_translation_speed = command_speed * MIN_TRANSLATION_SPEED_FRACTION
+        low_translation_costs = np.maximum(0.0, minimum_translation_speed - candidate_speeds)
+        in_place_turn_costs = low_translation_costs * np.abs(candidate_yaw_rates)
+        minimum_forward_speed = command_speed * MIN_FORWARD_SPEED_FRACTION
+        maximum_lateral_speed = command_speed * MAX_LATERAL_SPEED_FRACTION
+        forward_progress_costs = np.maximum(0.0, minimum_forward_speed - candidate_local_velocities[:, 0])
+        lateral_slide_costs = np.maximum(0.0, np.abs(candidate_local_velocities[:, 1]) - maximum_lateral_speed)
+    else:
+        low_translation_costs = np.zeros_like(candidate_speeds)
+        in_place_turn_costs = np.zeros_like(candidate_speeds)
+        forward_progress_costs = np.zeros_like(candidate_speeds)
+        lateral_slide_costs = np.zeros_like(candidate_speeds)
+    total_costs += (
+        1.25 * direction_costs
+        + 0.35 * speed_costs
+        + 0.35 * yaw_rate_costs
+        + 1.50 * low_translation_costs
+        + 2.00 * in_place_turn_costs
+        + 3.00 * forward_progress_costs
+        + 1.25 * lateral_slide_costs
+    )
 
     ranked_indices = candidate_indices[np.argsort(total_costs)]
     for database_index in ranked_indices:
@@ -289,9 +407,116 @@ def _select_locomotion_approach_index(
     return int(ranked_indices[0])
 
 
-def _command_vector_local(speed_mps: float, heading_deg: float) -> np.ndarray:
-    heading_rad = np.deg2rad(float(heading_deg))
-    return np.asarray([speed_mps * np.cos(heading_rad), speed_mps * np.sin(heading_rad)], dtype=np.float64)
+def _rotate_command_xy(command_xy: np.ndarray, delta_heading_deg: float) -> np.ndarray:
+    delta_heading = float(np.deg2rad(delta_heading_deg))
+    cosine = float(np.cos(delta_heading))
+    sine = float(np.sin(delta_heading))
+    x_value, y_value = np.asarray(command_xy, dtype=np.float64)
+    return np.asarray(
+        [
+            cosine * x_value - sine * y_value,
+            sine * x_value + cosine * y_value,
+        ],
+        dtype=np.float64,
+    )
+
+
+def _limit_command_heading_change(
+    previous_command_xy: np.ndarray,
+    target_command_xy: np.ndarray,
+    max_delta_degrees: float,
+) -> np.ndarray:
+    previous_command_xy = np.asarray(previous_command_xy, dtype=np.float64)
+    target_command_xy = np.asarray(target_command_xy, dtype=np.float64)
+    target_speed = float(np.linalg.norm(target_command_xy))
+    if target_speed < 1e-6:
+        return target_command_xy.copy()
+
+    previous_speed = float(np.linalg.norm(previous_command_xy))
+    if previous_speed < 1e-6:
+        return target_command_xy.copy()
+
+    previous_heading = float(np.arctan2(previous_command_xy[1], previous_command_xy[0]))
+    target_heading = float(np.arctan2(target_command_xy[1], target_command_xy[0]))
+    max_delta = float(np.deg2rad(max_delta_degrees))
+    heading_delta = float(np.clip(wrap_angle(target_heading - previous_heading), -max_delta, max_delta))
+    limited_heading = previous_heading + heading_delta
+    return np.asarray(
+        [target_speed * np.cos(limited_heading), target_speed * np.sin(limited_heading)],
+        dtype=np.float64,
+    )
+
+
+def _clamp_forward_steering_command(command_xy: np.ndarray, speed_mps: float) -> np.ndarray:
+    command_xy = np.asarray(command_xy, dtype=np.float64)
+    command_speed = float(np.linalg.norm(command_xy))
+    if command_speed < 1e-6:
+        return np.asarray([speed_mps, 0.0], dtype=np.float64)
+
+    max_heading = float(np.deg2rad(STEERING_QUERY_MAX_HEADING_DEGREES))
+    command_heading = float(np.arctan2(command_xy[1], command_xy[0]))
+    clamped_heading = float(np.clip(wrap_angle(command_heading), -max_heading, max_heading))
+    return np.asarray(
+        [speed_mps * np.cos(clamped_heading), speed_mps * np.sin(clamped_heading)],
+        dtype=np.float64,
+    )
+
+
+def _smoothstep(value: float) -> float:
+    value = float(np.clip(value, 0.0, 1.0))
+    return value * value * (3.0 - 2.0 * value)
+
+
+def _build_forward_steering_command_feature(
+    command_local_velocity_xy: np.ndarray,
+    *,
+    horizons: tuple[float, ...] = DEFAULT_HORIZONS,
+) -> np.ndarray:
+    command_local_velocity_xy = np.asarray(command_local_velocity_xy, dtype=np.float64)
+    command_speed = float(np.linalg.norm(command_local_velocity_xy))
+    if command_speed < 1e-6:
+        return np.asarray([component for _ in horizons for component in (0.0, 0.0, 1.0, 0.0)], dtype=np.float64)
+
+    max_heading = float(np.deg2rad(STEERING_QUERY_MAX_HEADING_DEGREES))
+    target_heading = float(np.clip(wrap_angle(np.arctan2(command_local_velocity_xy[1], command_local_velocity_xy[0])), -max_heading, max_heading))
+    max_horizon = max(float(max(horizons)), 1e-6)
+    feature: list[float] = []
+    for horizon in horizons:
+        horizon = float(horizon)
+        blend = _smoothstep(horizon / max_horizon)
+        local_heading = blend * target_heading
+        average_heading = 0.5 * local_heading
+        local_distance = command_speed * horizon
+        local_x = local_distance * np.cos(average_heading)
+        local_y = local_distance * np.sin(average_heading)
+        feature.extend((float(local_x), float(local_y), float(np.cos(local_heading)), float(np.sin(local_heading))))
+    return np.asarray(feature, dtype=np.float64)
+
+
+def _build_query_from_steering_plan(
+    *,
+    output_qpos: list[np.ndarray],
+    kinematics: KinematicsHelper,
+    dt: float,
+    command_local_velocity_xy: np.ndarray,
+    database: DatabaseBundle,
+) -> np.ndarray:
+    current_qpos = output_qpos[-1]
+    previous_qpos = output_qpos[-2] if len(output_qpos) >= 2 else None
+    pose_state = kinematics.runtime_pose_features(current_qpos, previous_qpos, dt)
+    command_feature = _build_forward_steering_command_feature(command_local_velocity_xy)
+    pose_feature = np.concatenate(
+        (
+            np.asarray(pose_state["left_foot_local_pos"], dtype=np.float64),
+            np.asarray(pose_state["left_foot_local_vel"], dtype=np.float64),
+            np.asarray(pose_state["right_foot_local_pos"], dtype=np.float64),
+            np.asarray(pose_state["right_foot_local_vel"], dtype=np.float64),
+            np.asarray(pose_state["root_local_velocity"], dtype=np.float64),
+        ),
+        axis=0,
+    )
+    query_feature = np.concatenate((command_feature, pose_feature), axis=0)
+    return normalize_features(query_feature, database.feature_mean, database.feature_std)
 
 
 def _build_query_from_output(
@@ -447,31 +672,6 @@ def _select_standing_start(
     if best_clip is None or best_frame_index is None:
         raise ValueError("无法从 locomotion 数据库中选择 standing 起始帧")
     return best_clip, best_frame_index
-
-
-def _skill_entry_target_root_height(
-    *,
-    database: DatabaseBundle,
-    clips: list[MotionClip],
-    skill_metadata: dict[str, Any],
-) -> float:
-    skill_start_frame = int(skill_metadata["skill_start_frame"])
-    allow_mirrored_skill = _skill_allows_mirrored_candidates(skill_metadata)
-    exact_frame_candidates = _skill_start_candidate_indices(
-        database=database,
-        clips=clips,
-        skill_name=skill_metadata["skill_name"],
-        skill_start_frame=skill_start_frame,
-        allow_mirrored=allow_mirrored_skill,
-    )
-    candidate_root_heights = np.asarray(
-        [
-            clips[int(database.clip_indices[int(database_index)])].qpos[int(database.frame_indices[int(database_index)]), 6]
-            for database_index in exact_frame_candidates
-        ],
-        dtype=np.float64,
-    )
-    return float(np.median(candidate_root_heights))
 
 
 def _append_clip_chunk(
@@ -745,28 +945,6 @@ def _approach_command_from_skill_entry_candidate(
     return (local_displacement / direction_norm) * float(desired_speed_mps)
 
 
-def _terrain_pose_from_root_qpos(
-    root_qpos: np.ndarray,
-    *,
-    mirrored: bool,
-    terrain_root_offset: dict[str, Any] | None,
-) -> dict[str, Any] | None:
-    if not terrain_root_offset:
-        return None
-
-    translation_local = np.asarray(terrain_root_offset.get("translation", [0.0, 0.0, 0.0]), dtype=np.float64).copy()
-    yaw_deg = float(terrain_root_offset.get("yaw_deg", 0.0))
-    if mirrored:
-        translation_local[1] *= -1.0
-        yaw_deg *= -1.0
-
-    return _terrain_pose_from_local_offset(
-        root_qpos,
-        translation_local=translation_local,
-        yaw_deg=yaw_deg,
-    )
-
-
 def _terrain_pose_from_local_offset(
     root_qpos: np.ndarray,
     *,
@@ -832,34 +1010,6 @@ def _terrain_pose_from_skill_asset_reference(
     )
 
 
-def _terrain_pose_from_fixed_skill(
-    clip: MotionClip,
-    source_frame: int,
-    terrain_root_offset: dict[str, Any] | None,
-) -> dict[str, Any] | None:
-    return _terrain_pose_from_root_qpos(
-        clip.qpos[source_frame],
-        mirrored=clip.mirrored,
-        terrain_root_offset=terrain_root_offset,
-    )
-
-
-def _skill_anchor_frame_for_terrain(
-    *,
-    source_start_frame: int,
-    skill_start_frame: int,
-    num_appended_frames: int,
-) -> tuple[int, int | None]:
-    if num_appended_frames <= 0:
-        return int(source_start_frame), None
-
-    first_appended_source_frame = int(source_start_frame) + 1
-    last_appended_source_frame = first_appended_source_frame + int(num_appended_frames) - 1
-    anchor_source_frame = int(np.clip(skill_start_frame, first_appended_source_frame, last_appended_source_frame))
-    output_offset = anchor_source_frame - first_appended_source_frame
-    return anchor_source_frame, output_offset
-
-
 def _generate_single_trajectory(
     *,
     database: DatabaseBundle,
@@ -867,6 +1017,7 @@ def _generate_single_trajectory(
     skill_metadata: dict[str, Any],
     rng: np.random.Generator,
     pre_skill_config: PreSkillConfig,
+    terrain_anchor_config: TerrainAnchorConfig,
     start_pose_config: StartPoseConfig,
     search_interval_frames: int,
     command_spring_damping: float,
@@ -875,7 +1026,13 @@ def _generate_single_trajectory(
     kinematics: KinematicsHelper,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     speed_mps = float(rng.choice(np.asarray(pre_skill_config.speed_levels_mps, dtype=np.float64)))
-    heading_deg = float(rng.choice(np.asarray(pre_skill_config.heading_degrees, dtype=np.float64)))
+    initial_heading_delta_deg = float(
+        np.clip(
+            rng.choice(np.asarray(pre_skill_config.heading_degrees, dtype=np.float64)),
+            -MAX_INITIAL_HEADING_DELTA_DEGREES,
+            MAX_INITIAL_HEADING_DELTA_DEGREES,
+        )
+    )
     pre_skill_distance_meters = float(
         rng.uniform(
             pre_skill_config.start_distance_min_meters,
@@ -885,11 +1042,12 @@ def _generate_single_trajectory(
     pre_skill_seconds = pre_skill_distance_meters / max(speed_mps, 1e-6)
     pre_skill_frames = max(search_interval_frames, int(round(pre_skill_seconds * clips[0].fps)))
 
-    approach_command = _command_vector_local(speed_mps, heading_deg)
+    approach_command = np.asarray([speed_mps, 0.0], dtype=np.float64)
     skill_command = np.asarray([speed_mps, 0.0], dtype=np.float64)
+    skill_transition_root_blend_frames = max(6, search_interval_frames)
     steering_clip_name: str | None = None
     steering_source_frame: int | None = None
-    skill_transition_root_blend_frames = max(6, search_interval_frames)
+    initial_heading_reference_deg: float | None = None
     skill_entry_settle_frames = max(6, search_interval_frames)
 
     output_qpos: list[np.ndarray] = []
@@ -897,20 +1055,16 @@ def _generate_single_trajectory(
     fps = clips[0].fps
     dt = 1.0 / float(fps)
 
-    target_start_root_height = _skill_entry_target_root_height(
-        database=database,
-        clips=clips,
-        skill_metadata=skill_metadata,
-    )
-    desired_start_root_height = target_start_root_height + float(start_pose_config.root_height_offset_meters)
     standing_clip, standing_frame_idx = _select_standing_start(
         database,
         clips,
-        target_root_height=target_start_root_height,
+        target_root_height=None,
         window_radius=start_pose_config.standing_window_radius_frames,
     )
     standing_qpos = standing_clip.qpos[standing_frame_idx].copy()
     selected_start_root_height = float(standing_qpos[6])
+    target_start_root_height = selected_start_root_height
+    desired_start_root_height = selected_start_root_height + float(start_pose_config.root_height_offset_meters)
     if start_pose_config.force_root_height_alignment:
         standing_qpos[6] = desired_start_root_height
     output_qpos.append(standing_qpos)
@@ -924,6 +1078,42 @@ def _generate_single_trajectory(
         )
     )
 
+    initial_pose_state = _runtime_pose_state_from_output(
+        output_qpos=output_qpos,
+        kinematics=kinematics,
+        dt=dt,
+    )
+    initial_query = _build_query_from_steering_plan(
+        output_qpos=output_qpos,
+        kinematics=kinematics,
+        dt=dt,
+        command_local_velocity_xy=approach_command,
+        database=database,
+    )
+    initial_skill_index = _select_skill_entry_index(
+        query_feature=initial_query,
+        skill_metadata=skill_metadata,
+        database=database,
+        clips=clips,
+        current_root_local_velocity_xy=initial_pose_state["root_local_velocity"][:2],
+        current_root_yaw_rate=_current_root_yaw_rate_from_output(output_qpos, dt),
+    )
+    initial_entry_command = _approach_command_from_skill_entry_candidate(
+        database_index=initial_skill_index,
+        database=database,
+        clips=clips,
+        desired_speed_mps=speed_mps,
+        direction_window_frames=pre_skill_config.approach_direction_window_frames,
+    )
+    initial_heading_reference_deg = float(np.rad2deg(np.arctan2(initial_entry_command[1], initial_entry_command[0])))
+    approach_command = _clamp_forward_steering_command(
+        _rotate_command_xy(initial_entry_command, initial_heading_delta_deg),
+        speed_mps,
+    )
+    steering_clip = clips[int(database.clip_indices[initial_skill_index])]
+    steering_clip_name = steering_clip.name
+    steering_source_frame = int(database.frame_indices[initial_skill_index])
+
     while (len(output_qpos) - 1) < pre_skill_frames:
         remaining_frames = pre_skill_frames - (len(output_qpos) - 1)
         pose_state = _runtime_pose_state_from_output(
@@ -931,13 +1121,12 @@ def _generate_single_trajectory(
             kinematics=kinematics,
             dt=dt,
         )
-        steering_query = _build_query_from_output(
+        steering_query = _build_query_from_steering_plan(
             output_qpos=output_qpos,
             kinematics=kinematics,
             dt=dt,
             command_local_velocity_xy=approach_command,
             database=database,
-            command_spring_damping=command_spring_damping,
         )
         steering_skill_index = _select_skill_entry_index(
             query_feature=steering_query,
@@ -947,24 +1136,31 @@ def _generate_single_trajectory(
             current_root_local_velocity_xy=pose_state["root_local_velocity"][:2],
             current_root_yaw_rate=_current_root_yaw_rate_from_output(output_qpos, dt),
         )
-        approach_command = _approach_command_from_skill_entry_candidate(
+        target_approach_command = _approach_command_from_skill_entry_candidate(
             database_index=steering_skill_index,
             database=database,
             clips=clips,
             desired_speed_mps=speed_mps,
             direction_window_frames=pre_skill_config.approach_direction_window_frames,
         )
+        approach_command = _clamp_forward_steering_command(
+            _limit_command_heading_change(
+                approach_command,
+                target_approach_command,
+                MAX_INITIAL_HEADING_DELTA_DEGREES,
+            ),
+            speed_mps,
+        )
         steering_clip = clips[int(database.clip_indices[steering_skill_index])]
         steering_clip_name = steering_clip.name
         steering_source_frame = int(database.frame_indices[steering_skill_index])
 
-        query_feature = _build_query_from_output(
+        query_feature = _build_query_from_steering_plan(
             output_qpos=output_qpos,
             kinematics=kinematics,
             dt=dt,
             command_local_velocity_xy=approach_command,
             database=database,
-            command_spring_damping=command_spring_damping,
         )
         database_index = _select_locomotion_approach_index(
             query_feature=query_feature,
@@ -1002,13 +1198,12 @@ def _generate_single_trajectory(
         dt=dt,
     )
     skill_start_frame = int(skill_metadata["skill_start_frame"])
-    skill_query = _build_query_from_output(
+    skill_query = _build_query_from_steering_plan(
         output_qpos=output_qpos,
         kinematics=kinematics,
         dt=dt,
         command_local_velocity_xy=approach_command,
         database=database,
-        command_spring_damping=command_spring_damping,
     )
     skill_database_index = _select_skill_entry_index(
         query_feature=skill_query,
@@ -1022,6 +1217,14 @@ def _generate_single_trajectory(
     skill_clip = clips[int(database.clip_indices[skill_database_index])]
     skill_frame = int(database.frame_indices[skill_database_index])
     skill_end_frame = int(skill_metadata["skill_end_frame"])
+    skill_transition_qpos = np.asarray(output_qpos[-1], dtype=np.float64)
+    terrain_world_pose = _terrain_pose_from_skill_asset_reference(
+        current_root_qpos=skill_transition_qpos,
+        skill_clip=skill_clip,
+        source_frame=skill_frame,
+        terrain_world_translation=np.asarray(terrain_anchor_config.translation, dtype=np.float64),
+        terrain_world_yaw_deg=float(terrain_anchor_config.yaw_deg),
+    )
     skill_output_start = len(output_qpos)
     skill_appended = _append_clip_chunk(
         output_qpos=output_qpos,
@@ -1040,23 +1243,6 @@ def _generate_single_trajectory(
             num_output_frames=len(skill_appended),
             output_start_frame=skill_output_start,
         )
-    )
-    skill_output_source_frame, skill_anchor_output_offset = _skill_anchor_frame_for_terrain(
-        source_start_frame=skill_frame,
-        skill_start_frame=skill_start_frame,
-        num_appended_frames=len(skill_appended),
-    )
-    if skill_anchor_output_offset is not None:
-        skill_anchor_qpos = np.asarray(
-            output_qpos[skill_output_start + skill_anchor_output_offset],
-            dtype=np.float64,
-        )
-    else:
-        skill_anchor_qpos = np.asarray(output_qpos[-1], dtype=np.float64)
-    terrain_world_pose = _terrain_pose_from_skill_asset_reference(
-        current_root_qpos=skill_anchor_qpos,
-        skill_clip=skill_clip,
-        source_frame=skill_output_source_frame,
     )
 
     target_total_frames = len(output_qpos) + post_skill_frames
@@ -1114,6 +1300,8 @@ def _generate_single_trajectory(
             "target_root_height": float(target_start_root_height),
             "desired_root_height": float(desired_start_root_height),
             "final_root_height": float(output_qpos[0][6]),
+            "root_translation": [float(value) for value in output_qpos[0][4:7].tolist()],
+            "root_yaw_deg": float(np.rad2deg(quaternion_to_yaw(output_qpos[0][:4]))),
             "force_root_height_alignment": bool(start_pose_config.force_root_height_alignment),
             "root_height_offset_meters": float(start_pose_config.root_height_offset_meters),
         },
@@ -1121,35 +1309,39 @@ def _generate_single_trajectory(
         "skill_anchor": {
             "fixed_world": False,
             "entry_source_frame": int(skill_frame),
-            "source_frame": int(skill_output_source_frame),
+            "source_frame": int(skill_frame),
+            "selection_mode": "runtime_entry_match",
+            "database_index": int(skill_database_index),
             "mirrored": bool(skill_clip.mirrored),
             "mirroring_allowed": bool(_skill_allows_mirrored_candidates(skill_metadata)),
-            "root_translation": [float(value) for value in skill_clip.qpos[skill_output_source_frame, 4:7].tolist()],
-            "root_yaw_deg": float(np.rad2deg(quaternion_to_yaw(skill_clip.qpos[skill_output_source_frame, :4]))),
+            "root_translation": [float(value) for value in skill_clip.qpos[skill_frame, 4:7].tolist()],
+            "root_yaw_deg": float(np.rad2deg(quaternion_to_yaw(skill_clip.qpos[skill_frame, :4]))),
         },
         "terrain_anchor": {
-            "applied_source_frame": int(skill_output_source_frame),
-            "applied_output_frame": (
-                None
-                if skill_anchor_output_offset is None
-                else int(skill_output_start + skill_anchor_output_offset)
-            ),
+            "applied_source_frame": int(skill_frame),
+            "applied_output_frame": int(skill_output_start - 1),
             "interpreted_as": "terrain_asset_origin_in_skill_clip_world",
-            "anchor_policy": "skill_start_frame",
+            "anchor_policy": "matched_entry_frame_to_transition_root",
         },
         "command": {
             "speed_mps": speed_mps,
-            "initial_heading_deg": heading_deg,
+            "initial_heading_reference_deg": initial_heading_reference_deg,
+            "initial_heading_delta_deg": initial_heading_delta_deg,
+            "max_initial_heading_delta_degrees": MAX_INITIAL_HEADING_DELTA_DEGREES,
+            "steering_query_max_heading_degrees": STEERING_QUERY_MAX_HEADING_DEGREES,
+            "min_forward_speed_fraction": MIN_FORWARD_SPEED_FRACTION,
+            "max_lateral_speed_fraction": MAX_LATERAL_SPEED_FRACTION,
             "approach_command_local_xy": [float(value) for value in approach_command.tolist()],
             "pre_skill_distance_meters": pre_skill_distance_meters,
+            "min_start_distance_meters": MIN_START_DISTANCE_METERS,
             "pre_skill_seconds": pre_skill_seconds,
             "pre_skill_frames": pre_skill_frames,
             "post_skill_frames": post_skill_frames,
         },
         "approach": {
-            "target_source_frame": skill_frame,
             "target_clip_name": skill_clip.name,
-            "steering_mode": "skill_entry_direction_with_locomotion_alignment",
+            "matched_entry_source_frame": int(skill_frame),
+            "steering_mode": "forward_arc_plan_to_skill_entry_direction",
             "steering_window_frames": int(pre_skill_config.approach_direction_window_frames),
             "last_steering_clip_name": steering_clip_name,
             "last_steering_source_frame": steering_source_frame,
@@ -1196,6 +1388,17 @@ def main() -> None:
         type=int,
         default=1,
         help="要生成的轨迹数量。",
+    )
+    parser.add_argument(
+        "--target-total",
+        type=int,
+        default=None,
+        help="目标总轨迹数；配合 --append-existing 时只生成缺少的尾部编号。",
+    )
+    parser.add_argument(
+        "--append-existing",
+        action="store_true",
+        help="保留已有轨迹文件和 manifest 条目，从已有连续编号后继续生成。",
     )
     parser.add_argument(
         "--output-dir",
@@ -1249,6 +1452,7 @@ def main() -> None:
     database = _load_database_bundle(args.database_dir)
     clips = _load_clip_catalog(database.manifest)
     pre_skill_config = _load_pre_skill_config(args.generation_config)
+    terrain_anchor_config = _load_terrain_anchor_config(args.generation_config)
     start_pose_config = _load_start_pose_config(args.generation_config)
     target_skill_names = _resolve_target_skill_names(
         database.manifest,
@@ -1269,23 +1473,63 @@ def main() -> None:
             output_dir = resolve_repo_path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        skill_seed = args.seed + skill_offset
+        existing_count = 0
+        generation_start_index = 0
+        generation_end_index = args.num_trajectories
+        requested_total = args.num_trajectories
+        if args.target_total is not None:
+            if args.target_total < 0:
+                raise ValueError("--target-total 不能小于 0")
+            requested_total = args.target_total
+            generation_end_index = args.target_total
+            if args.append_existing:
+                existing_count = _count_existing_trajectories(output_dir, target_skill_name)
+                generation_start_index = min(existing_count, args.target_total)
+        elif args.append_existing:
+            existing_count = _count_existing_trajectories(output_dir, target_skill_name)
+            generation_start_index = existing_count
+            generation_end_index = existing_count + args.num_trajectories
+            requested_total = generation_end_index
+
+        skill_seed = args.seed + skill_offset + generation_start_index * 1_000_003
         rng = np.random.default_rng(skill_seed)
         trajectory_manifests: list[dict[str, Any]] = []
-        for trajectory_index in range(args.num_trajectories):
-            qpos_trajectory, trajectory_manifest = _generate_single_trajectory(
-                database=database,
-                clips=clips,
-                skill_metadata=skill_metadata,
-                rng=rng,
-                pre_skill_config=pre_skill_config,
-                start_pose_config=start_pose_config,
-                search_interval_frames=args.search_interval_frames,
-                command_spring_damping=args.command_spring_damping,
-                inertialization_damping=args.inertialization_damping,
-                post_skill_frames=post_skill_frames,
-                kinematics=kinematics,
+        if args.append_existing and generation_start_index > 0:
+            trajectory_manifests = _load_existing_trajectory_manifests(
+                output_dir,
+                skill_metadata,
+                target_skill_name,
+                generation_start_index,
             )
+            print(
+                f"[info] {target_skill_name}: 已有连续轨迹 {generation_start_index} 条，"
+                f"本次生成 {generation_end_index - generation_start_index} 条。"
+            )
+
+        for trajectory_index in range(generation_start_index, generation_end_index):
+            last_error: Exception | None = None
+            for attempt_index in range(20):
+                try:
+                    qpos_trajectory, trajectory_manifest = _generate_single_trajectory(
+                        database=database,
+                        clips=clips,
+                        skill_metadata=skill_metadata,
+                        rng=rng,
+                        pre_skill_config=pre_skill_config,
+                        terrain_anchor_config=terrain_anchor_config,
+                        start_pose_config=start_pose_config,
+                        search_interval_frames=args.search_interval_frames,
+                        command_spring_damping=args.command_spring_damping,
+                        inertialization_damping=args.inertialization_damping,
+                        post_skill_frames=post_skill_frames,
+                        kinematics=kinematics,
+                    )
+                    break
+                except RuntimeError as exc:
+                    last_error = exc
+                    print(f"[warn] {target_skill_name} #{trajectory_index} 第 {attempt_index + 1} 次采样失败：{exc}")
+            else:
+                raise RuntimeError(f"{target_skill_name} #{trajectory_index} 连续采样失败") from last_error
 
             trajectory_name = f"{sanitize_skill_name(target_skill_name)}_{trajectory_index:04d}"
             trajectory_path = output_dir / f"{trajectory_name}.npz"
@@ -1307,17 +1551,27 @@ def main() -> None:
             "skill_name": target_skill_name,
             "skill_prefix": args.skill_prefix,
             "all_scales": bool(args.all_scales),
-            "num_trajectories": args.num_trajectories,
+            "num_trajectories": requested_total,
             "seed": skill_seed,
             "generation_config_path": str(resolve_repo_path(args.generation_config).relative_to(resolve_repo_path("."))),
             "pre_skill_config": {
                 "speed_levels_mps": [float(value) for value in pre_skill_config.speed_levels_mps],
                 "heading_degrees": [float(value) for value in pre_skill_config.heading_degrees],
+                "max_initial_heading_delta_degrees": float(MAX_INITIAL_HEADING_DELTA_DEGREES),
+                "min_start_distance_meters": float(MIN_START_DISTANCE_METERS),
+                "min_translation_speed_fraction": float(MIN_TRANSLATION_SPEED_FRACTION),
+                "min_forward_speed_fraction": float(MIN_FORWARD_SPEED_FRACTION),
+                "max_lateral_speed_fraction": float(MAX_LATERAL_SPEED_FRACTION),
+                "steering_query_max_heading_degrees": float(STEERING_QUERY_MAX_HEADING_DEGREES),
                 "start_distance_meters": {
                     "min": float(pre_skill_config.start_distance_min_meters),
                     "max": float(pre_skill_config.start_distance_max_meters),
                 },
                 "approach_direction_window_frames": int(pre_skill_config.approach_direction_window_frames),
+            },
+            "terrain_asset_reference_config": {
+                "translation": [float(value) for value in terrain_anchor_config.translation],
+                "yaw_deg": float(terrain_anchor_config.yaw_deg),
             },
             "start_pose_config": {
                 "standing_window_radius_frames": int(start_pose_config.standing_window_radius_frames),

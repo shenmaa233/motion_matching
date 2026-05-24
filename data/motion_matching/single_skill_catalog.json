@@ -7,7 +7,7 @@
       "terrain_path": "data/models/terrain/climb_08/multi_boxes_z_scale_1.0.urdf",
       "skill_start_frame": 72,
       "skill_end_frame": 320,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -17,7 +17,7 @@
       "terrain_path": "data/models/terrain/climb_09/multi_boxes_z_scale_1.0.urdf",
       "skill_start_frame": 75,
       "skill_end_frame": 320,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -27,7 +27,7 @@
       "terrain_path": "data/models/terrain/climb_15/multi_boxes_z_scale_0.8.urdf",
       "skill_start_frame": 50,
       "skill_end_frame": 140,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -37,7 +37,7 @@
       "terrain_path": "data/models/terrain/climb_15/multi_boxes_z_scale_0.9.urdf",
       "skill_start_frame": 50,
       "skill_end_frame": 140,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -47,7 +47,7 @@
       "terrain_path": "data/models/terrain/climb_15/multi_boxes_z_scale_1.0.urdf",
       "skill_start_frame": 50,
       "skill_end_frame": 140,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -57,7 +57,7 @@
       "terrain_path": "data/models/terrain/climb_15/multi_boxes_z_scale_1.1.urdf",
       "skill_start_frame": 50,
       "skill_end_frame": 140,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -67,7 +67,7 @@
       "terrain_path": "data/models/terrain/climb_15/multi_boxes_z_scale_1.2.urdf",
       "skill_start_frame": 50,
       "skill_end_frame": 140,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -77,7 +77,7 @@
       "terrain_path": "data/models/terrain/climb_16/multi_boxes_z_scale_0.8.urdf",
       "skill_start_frame": 64,
       "skill_end_frame": 140,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -87,7 +87,7 @@
       "terrain_path": "data/models/terrain/climb_16/multi_boxes_z_scale_0.9.urdf",
       "skill_start_frame": 64,
       "skill_end_frame": 140,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -97,7 +97,7 @@
       "terrain_path": "data/models/terrain/climb_16/multi_boxes_z_scale_1.0.urdf",
       "skill_start_frame": 64,
       "skill_end_frame": 140,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -107,7 +107,7 @@
       "terrain_path": "data/models/terrain/climb_16/multi_boxes_z_scale_1.1.urdf",
       "skill_start_frame": 64,
       "skill_end_frame": 140,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -117,7 +117,7 @@
       "terrain_path": "data/models/terrain/climb_16/multi_boxes_z_scale_1.2.urdf",
       "skill_start_frame": 64,
       "skill_end_frame": 140,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -127,7 +127,7 @@
       "terrain_path": "data/models/terrain/climb_17/multi_boxes_z_scale_0.8.urdf",
       "skill_start_frame": 48,
       "skill_end_frame": 150,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -137,7 +137,7 @@
       "terrain_path": "data/models/terrain/climb_17/multi_boxes_z_scale_0.9.urdf",
       "skill_start_frame": 48,
       "skill_end_frame": 150,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -147,7 +147,7 @@
       "terrain_path": "data/models/terrain/climb_17/multi_boxes_z_scale_1.0.urdf",
       "skill_start_frame": 48,
       "skill_end_frame": 150,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -157,7 +157,7 @@
       "terrain_path": "data/models/terrain/climb_17/multi_boxes_z_scale_1.1.urdf",
       "skill_start_frame": 48,
       "skill_end_frame": 150,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -167,7 +167,7 @@
       "terrain_path": "data/models/terrain/climb_17/multi_boxes_z_scale_1.2.urdf",
       "skill_start_frame": 48,
       "skill_end_frame": 150,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -177,7 +177,7 @@
       "terrain_path": "data/models/terrain/climb_18/multi_boxes_z_scale_0.8.urdf",
       "skill_start_frame": 68,
       "skill_end_frame": 115,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -187,7 +187,7 @@
       "terrain_path": "data/models/terrain/climb_18/multi_boxes_z_scale_0.9.urdf",
       "skill_start_frame": 68,
       "skill_end_frame": 115,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -197,7 +197,7 @@
       "terrain_path": "data/models/terrain/climb_18/multi_boxes_z_scale_1.0.urdf",
       "skill_start_frame": 68,
       "skill_end_frame": 115,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -207,7 +207,7 @@
       "terrain_path": "data/models/terrain/climb_18/multi_boxes_z_scale_1.1.urdf",
       "skill_start_frame": 68,
       "skill_end_frame": 115,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -217,7 +217,7 @@
       "terrain_path": "data/models/terrain/climb_18/multi_boxes_z_scale_1.2.urdf",
       "skill_start_frame": 68,
       "skill_end_frame": 115,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -227,7 +227,7 @@
       "terrain_path": "data/models/terrain/climb_20/multi_boxes_z_scale_1.0.urdf",
       "skill_start_frame": 70,
       "skill_end_frame": 360,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     },
@@ -237,7 +237,7 @@
       "terrain_path": "data/models/terrain/climb_24/multi_boxes_z_scale_1.0.urdf",
       "skill_start_frame": 60,
       "skill_end_frame": 313,
-      "entry_window_length": 24,
+      "entry_window_length": 40,
       "annotation_source": "heuristic_seed",
       "needs_review": true
     }
