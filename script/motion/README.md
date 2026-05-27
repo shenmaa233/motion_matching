@@ -15,11 +15,16 @@
 ## 默认流程
 1. 先检查或修改 `data/motion_matching/single_skill_catalog.json`。
 2. 构建数据库：
-   `python script/motion/build_single_skill_database.py`
+    `python script/motion/build_single_skill_database.py`
+    `python script/motion/generate_single_skill_batch.py \
+    --skill-name climb_17_z_scale_1.0 \
+    --num-trajectories 3 \
+    --output-dir output/motion_matching/generated/climb_17_z_scale_1.0 \
+    --seed 0`
 3. 生成批量轨迹：
    `python script/motion/generate_single_skill_batch.py --num-trajectories 4`
 4. 可视化生成结果：
-   `python script/visual/visualize_lafan.py --input-dir output/motion_matching/generated/climb_15_z_scale_1.0 --terrain` 
+   `python script/visual/visualize_lafan.py --input-dir output/motion_matching/generated/climb_15_z_scale_1.0_heading_75 --terrain` 
 
 ## 相关文档
 - `docs/approach_steering_fix.md`

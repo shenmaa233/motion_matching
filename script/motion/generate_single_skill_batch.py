@@ -35,7 +35,7 @@ from motion_matching_common import (
     world_to_local_vector,
 )
 
-MAX_INITIAL_HEADING_DELTA_DEGREES = 45.0
+MAX_INITIAL_HEADING_DELTA_DEGREES = 75.0
 MIN_START_DISTANCE_METERS = 2.0
 MIN_TRANSLATION_SPEED_FRACTION = 0.35
 MIN_FORWARD_SPEED_FRACTION = 0.45
@@ -405,61 +405,6 @@ def _select_locomotion_approach_index(
             return int(database_index)
 
     return int(ranked_indices[0])
-
-
-def _rotate_command_xy(command_xy: np.ndarray, delta_heading_deg: float) -> np.ndarray:
-    delta_heading = float(np.deg2rad(delta_heading_deg))
-    cosine = float(np.cos(delta_heading))
-    sine = float(np.sin(delta_heading))
-    x_value, y_value = np.asarray(command_xy, dtype=np.float64)
-    return np.asarray(
-        [
-            cosine * x_value - sine * y_value,
-            sine * x_value + cosine * y_value,
-        ],
-        dtype=np.float64,
-    )
-
-
-def _limit_command_heading_change(
-    previous_command_xy: np.ndarray,
-    target_command_xy: np.ndarray,
-    max_delta_degrees: float,
-) -> np.ndarray:
-    previous_command_xy = np.asarray(previous_command_xy, dtype=np.float64)
-    target_command_xy = np.asarray(target_command_xy, dtype=np.float64)
-    target_speed = float(np.linalg.norm(target_command_xy))
-    if target_speed < 1e-6:
-        return target_command_xy.copy()
-
-    previous_speed = float(np.linalg.norm(previous_command_xy))
-    if previous_speed < 1e-6:
-        return target_command_xy.copy()
-
-    previous_heading = float(np.arctan2(previous_command_xy[1], previous_command_xy[0]))
-    target_heading = float(np.arctan2(target_command_xy[1], target_command_xy[0]))
-    max_delta = float(np.deg2rad(max_delta_degrees))
-    heading_delta = float(np.clip(wrap_angle(target_heading - previous_heading), -max_delta, max_delta))
-    limited_heading = previous_heading + heading_delta
-    return np.asarray(
-        [target_speed * np.cos(limited_heading), target_speed * np.sin(limited_heading)],
-        dtype=np.float64,
-    )
-
-
-def _clamp_forward_steering_command(command_xy: np.ndarray, speed_mps: float) -> np.ndarray:
-    command_xy = np.asarray(command_xy, dtype=np.float64)
-    command_speed = float(np.linalg.norm(command_xy))
-    if command_speed < 1e-6:
-        return np.asarray([speed_mps, 0.0], dtype=np.float64)
-
-    max_heading = float(np.deg2rad(STEERING_QUERY_MAX_HEADING_DEGREES))
-    command_heading = float(np.arctan2(command_xy[1], command_xy[0]))
-    clamped_heading = float(np.clip(wrap_angle(command_heading), -max_heading, max_heading))
-    return np.asarray(
-        [speed_mps * np.cos(clamped_heading), speed_mps * np.sin(clamped_heading)],
-        dtype=np.float64,
-    )
 
 
 def _smoothstep(value: float) -> float:
@@ -1062,6 +1007,7 @@ def _generate_single_trajectory(
         window_radius=start_pose_config.standing_window_radius_frames,
     )
     standing_qpos = standing_clip.qpos[standing_frame_idx].copy()
+    standing_qpos[:4] = quaternion_from_yaw(np.deg2rad(initial_heading_delta_deg))
     selected_start_root_height = float(standing_qpos[6])
     target_start_root_height = selected_start_root_height
     desired_start_root_height = selected_start_root_height + float(start_pose_config.root_height_offset_meters)
@@ -1106,55 +1052,13 @@ def _generate_single_trajectory(
         direction_window_frames=pre_skill_config.approach_direction_window_frames,
     )
     initial_heading_reference_deg = float(np.rad2deg(np.arctan2(initial_entry_command[1], initial_entry_command[0])))
-    approach_command = _clamp_forward_steering_command(
-        _rotate_command_xy(initial_entry_command, initial_heading_delta_deg),
-        speed_mps,
-    )
+    approach_command = np.asarray([speed_mps, 0.0], dtype=np.float64)
     steering_clip = clips[int(database.clip_indices[initial_skill_index])]
     steering_clip_name = steering_clip.name
     steering_source_frame = int(database.frame_indices[initial_skill_index])
 
     while (len(output_qpos) - 1) < pre_skill_frames:
         remaining_frames = pre_skill_frames - (len(output_qpos) - 1)
-        pose_state = _runtime_pose_state_from_output(
-            output_qpos=output_qpos,
-            kinematics=kinematics,
-            dt=dt,
-        )
-        steering_query = _build_query_from_steering_plan(
-            output_qpos=output_qpos,
-            kinematics=kinematics,
-            dt=dt,
-            command_local_velocity_xy=approach_command,
-            database=database,
-        )
-        steering_skill_index = _select_skill_entry_index(
-            query_feature=steering_query,
-            skill_metadata=skill_metadata,
-            database=database,
-            clips=clips,
-            current_root_local_velocity_xy=pose_state["root_local_velocity"][:2],
-            current_root_yaw_rate=_current_root_yaw_rate_from_output(output_qpos, dt),
-        )
-        target_approach_command = _approach_command_from_skill_entry_candidate(
-            database_index=steering_skill_index,
-            database=database,
-            clips=clips,
-            desired_speed_mps=speed_mps,
-            direction_window_frames=pre_skill_config.approach_direction_window_frames,
-        )
-        approach_command = _clamp_forward_steering_command(
-            _limit_command_heading_change(
-                approach_command,
-                target_approach_command,
-                MAX_INITIAL_HEADING_DELTA_DEGREES,
-            ),
-            speed_mps,
-        )
-        steering_clip = clips[int(database.clip_indices[steering_skill_index])]
-        steering_clip_name = steering_clip.name
-        steering_source_frame = int(database.frame_indices[steering_skill_index])
-
         query_feature = _build_query_from_steering_plan(
             output_qpos=output_qpos,
             kinematics=kinematics,
@@ -1327,6 +1231,8 @@ def _generate_single_trajectory(
             "speed_mps": speed_mps,
             "initial_heading_reference_deg": initial_heading_reference_deg,
             "initial_heading_delta_deg": initial_heading_delta_deg,
+            "heading_randomization_enabled": False,
+            "path_heading_randomization_enabled": True,
             "max_initial_heading_delta_degrees": MAX_INITIAL_HEADING_DELTA_DEGREES,
             "steering_query_max_heading_degrees": STEERING_QUERY_MAX_HEADING_DEGREES,
             "min_forward_speed_fraction": MIN_FORWARD_SPEED_FRACTION,
@@ -1341,7 +1247,7 @@ def _generate_single_trajectory(
         "approach": {
             "target_clip_name": skill_clip.name,
             "matched_entry_source_frame": int(skill_frame),
-            "steering_mode": "forward_arc_plan_to_skill_entry_direction",
+            "steering_mode": "straight_shortest_path_to_skill_entry",
             "steering_window_frames": int(pre_skill_config.approach_direction_window_frames),
             "last_steering_clip_name": steering_clip_name,
             "last_steering_source_frame": steering_source_frame,
@@ -1557,6 +1463,8 @@ def main() -> None:
             "pre_skill_config": {
                 "speed_levels_mps": [float(value) for value in pre_skill_config.speed_levels_mps],
                 "heading_degrees": [float(value) for value in pre_skill_config.heading_degrees],
+                "heading_randomization_enabled": False,
+                "path_heading_randomization_enabled": True,
                 "max_initial_heading_delta_degrees": float(MAX_INITIAL_HEADING_DELTA_DEGREES),
                 "min_start_distance_meters": float(MIN_START_DISTANCE_METERS),
                 "min_translation_speed_fraction": float(MIN_TRANSLATION_SPEED_FRACTION),
