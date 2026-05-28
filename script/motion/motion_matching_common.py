@@ -99,6 +99,7 @@ class SkillMetadata:
     skill_end_frame: int
     entry_window_length: int
     terrain_root_offset: dict[str, Any] | None
+    allow_mirrored_skill: bool | None
     annotation_source: str
     needs_review: bool
 
@@ -309,6 +310,54 @@ def clip_name_from_path(path: Path) -> str:
     return path.stem
 
 
+def _motion_clip_from_qpos(
+    path: Path,
+    data: np.lib.npyio.NpzFile,
+    *,
+    clip_name: str | None = None,
+) -> MotionClip:
+    if "qpos" not in data or "fps" not in data:
+        raise KeyError(f"{path} 缺少 qpos-only clip 所需字段: ['qpos', 'fps']")
+
+    qpos = np.asarray(data["qpos"], dtype=np.float64)
+    fps = int(round(float(np.asarray(data["fps"]).reshape(-1)[0])))
+    if qpos.ndim != 2 or qpos.shape[1] != 7 + len(CANONICAL_JOINT_NAMES):
+        raise ValueError(
+            f"{path} 的 qpos 维度是 {qpos.shape}，预期第二维为 {7 + len(CANONICAL_JOINT_NAMES)}"
+        )
+
+    kinematics = KinematicsHelper()
+    body_pos_w = np.zeros((qpos.shape[0], len(CANONICAL_BODY_NAMES), 3), dtype=np.float64)
+    body_quat_w = np.zeros((qpos.shape[0], len(CANONICAL_BODY_NAMES), 4), dtype=np.float64)
+    for frame_index, frame_qpos in enumerate(qpos):
+        positions, quaternions = kinematics.canonical_body_poses(frame_qpos)
+        body_pos_w[frame_index] = positions
+        body_quat_w[frame_index] = quaternions
+
+    dt = 1.0 / float(fps)
+    joint_pos = qpos[:, 7:]
+    joint_vel = centered_finite_difference(joint_pos, dt)
+    body_lin_vel_w = centered_finite_difference(body_pos_w, dt)
+    body_ang_vel_w = np.zeros((qpos.shape[0], len(CANONICAL_BODY_NAMES), 3), dtype=np.float64)
+    for body_index in range(len(CANONICAL_BODY_NAMES)):
+        body_ang_vel_w[:, body_index] = quaternion_velocity_series(body_quat_w[:, body_index], dt)
+
+    return MotionClip(
+        name=clip_name or clip_name_from_path(path),
+        source_path=str(path.relative_to(REPO_ROOT)),
+        qpos=qpos,
+        joint_pos=joint_pos,
+        joint_vel=joint_vel,
+        body_pos_w=body_pos_w,
+        body_quat_w=normalize_quaternion(body_quat_w),
+        body_lin_vel_w=body_lin_vel_w,
+        body_ang_vel_w=body_ang_vel_w,
+        fps=fps,
+        mirrored=False,
+        source_name=clip_name or clip_name_from_path(path),
+    )
+
+
 def load_motion_clip(path_like: str | Path, *, clip_name: str | None = None) -> MotionClip:
     path = resolve_repo_path(path_like)
     data = np.load(path, allow_pickle=True)
@@ -323,6 +372,8 @@ def load_motion_clip(path_like: str | Path, *, clip_name: str | None = None) -> 
     )
     missing = [key for key in required_keys if key not in data]
     if missing:
+        if "qpos" in data and "fps" in data:
+            return _motion_clip_from_qpos(path, data, clip_name=clip_name)
         raise KeyError(f"{path} 缺少必要字段: {missing}")
 
     joint_pos = np.asarray(data["joint_pos"], dtype=np.float64)
@@ -443,6 +494,9 @@ def load_skill_catalog(path_like: str | Path) -> list[SkillMetadata]:
                 skill_end_frame=int(raw["skill_end_frame"]),
                 entry_window_length=int(raw["entry_window_length"]),
                 terrain_root_offset=raw.get("terrain_root_offset"),
+                allow_mirrored_skill=(
+                    bool(raw["allow_mirrored_skill"]) if "allow_mirrored_skill" in raw else None
+                ),
                 annotation_source=str(raw.get("annotation_source", "manual")),
                 needs_review=bool(raw.get("needs_review", False)),
             )
@@ -462,6 +516,11 @@ def skill_catalog_to_json(skills: list[SkillMetadata]) -> dict[str, Any]:
                 "skill_end_frame": skill.skill_end_frame,
                 "entry_window_length": skill.entry_window_length,
                 "terrain_root_offset": skill.terrain_root_offset,
+                **(
+                    {"allow_mirrored_skill": skill.allow_mirrored_skill}
+                    if skill.allow_mirrored_skill is not None
+                    else {}
+                ),
                 "annotation_source": skill.annotation_source,
                 "needs_review": skill.needs_review,
             }

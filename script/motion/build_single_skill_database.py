@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -94,6 +95,11 @@ def main() -> None:
         action="store_true",
         help="关闭左右镜像扩增。",
     )
+    parser.add_argument(
+        "--skip-body-mapping-report",
+        action="store_true",
+        help="跳过 body mapping report 采样，避免在缺少或异常的 pydrake 环境下失败。",
+    )
     args = parser.parse_args()
 
     locomotion_dir = resolve_repo_path(args.locomotion_dir)
@@ -119,8 +125,16 @@ def main() -> None:
     mapping_reports: list[dict] = []
 
     locomotion_clips = [load_motion_clip(path) for path in locomotion_paths]
-    if locomotion_clips:
-        mapping_reports.append(sample_body_mapping_report(locomotion_clips[0]))
+    body_mapping_report_enabled = not args.skip_body_mapping_report
+    if body_mapping_report_enabled and locomotion_clips:
+        try:
+            mapping_reports.append(sample_body_mapping_report(locomotion_clips[0]))
+        except Exception as exc:  # pylint: disable=broad-except
+            warnings.warn(
+                f"跳过 body mapping report：初始化 pydrake 失败（{exc}）",
+                RuntimeWarning,
+            )
+            body_mapping_report_enabled = False
 
     for clip in locomotion_clips:
         _append_clip_to_database(
@@ -158,7 +172,8 @@ def main() -> None:
 
     for skill in skills:
         clip = load_motion_clip(skill.skill_path, clip_name=skill.skill_name)
-        mapping_reports.append(sample_body_mapping_report(clip))
+        if body_mapping_report_enabled:
+            mapping_reports.append(sample_body_mapping_report(clip))
         _append_clip_to_database(
             clip=clip,
             category="skill",
