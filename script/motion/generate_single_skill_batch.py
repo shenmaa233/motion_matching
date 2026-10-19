@@ -35,7 +35,7 @@ from motion_matching_common import (
     world_to_local_vector,
 )
 
-MAX_INITIAL_HEADING_DELTA_DEGREES = 75.0
+MAX_INITIAL_HEADING_DELTA_DEGREES = 90.0
 MIN_START_DISTANCE_METERS = 2.0
 MIN_TRANSLATION_SPEED_FRACTION = 0.35
 MIN_FORWARD_SPEED_FRACTION = 0.45
@@ -67,7 +67,19 @@ class PreSkillConfig:
     heading_degrees: tuple[float, ...]
     start_distance_min_meters: float
     start_distance_max_meters: float
+    duration_min_seconds: float | None
+    duration_max_seconds: float | None
+    average_interval_seconds: float | None
+    samples_per_speed_heading: int
     approach_direction_window_frames: int
+
+
+@dataclass(frozen=True)
+class PreSkillSample:
+    speed_mps: float
+    heading_degrees: float
+    duration_seconds: float | None
+    schedule_index: int
 
 
 @dataclass(frozen=True)
@@ -95,27 +107,113 @@ def _load_pre_skill_config(config_path: Path) -> PreSkillConfig:
     payload = json.loads(resolved_path.read_text(encoding="utf-8"))
     pre_skill_payload = payload.get("pre_skill", {})
     start_distance_payload = pre_skill_payload.get("start_distance_meters", {})
+    duration_payload = pre_skill_payload.get("duration_seconds")
+    if duration_payload is None:
+        duration_min_seconds = None
+        duration_max_seconds = None
+        average_interval_seconds = None
+    else:
+        duration_min_seconds = float(duration_payload["min"])
+        duration_max_seconds = float(duration_payload["max"])
+        average_interval_seconds = float(duration_payload.get("average_interval", 0.3))
     config = PreSkillConfig(
         speed_levels_mps=tuple(float(value) for value in pre_skill_payload.get("speed_levels_mps", DEFAULT_SPEED_LEVELS)),
         heading_degrees=tuple(float(value) for value in pre_skill_payload.get("heading_degrees", DEFAULT_HEADING_DEGREES)),
         start_distance_min_meters=float(start_distance_payload.get("min", 0.5)),
         start_distance_max_meters=float(start_distance_payload.get("max", 6.0)),
+        duration_min_seconds=duration_min_seconds,
+        duration_max_seconds=duration_max_seconds,
+        average_interval_seconds=average_interval_seconds,
+        samples_per_speed_heading=int(pre_skill_payload.get("samples_per_speed_heading", 1)),
         approach_direction_window_frames=int(pre_skill_payload.get("approach_direction_window_frames", 30)),
     )
     if len(config.speed_levels_mps) == 0:
         raise ValueError(f"{resolved_path} 的 pre_skill.speed_levels_mps 不能为空")
     if len(config.heading_degrees) == 0:
         raise ValueError(f"{resolved_path} 的 pre_skill.heading_degrees 不能为空")
-    if config.start_distance_min_meters < MIN_START_DISTANCE_METERS:
+    if config.duration_min_seconds is None and config.start_distance_min_meters < MIN_START_DISTANCE_METERS:
         raise ValueError(
             f"{resolved_path} 的 pre_skill.start_distance_meters.min 不能小于 "
             f"{MIN_START_DISTANCE_METERS:.1f}，否则没有足够距离完成进入 skill 前的方向调整"
         )
     if config.start_distance_max_meters < config.start_distance_min_meters:
         raise ValueError(f"{resolved_path} 的 pre_skill.start_distance_meters.max 不能小于 min")
+    if config.duration_min_seconds is not None:
+        if config.duration_min_seconds <= 0.0:
+            raise ValueError(f"{resolved_path} 的 pre_skill.duration_seconds.min 必须大于 0")
+        if config.duration_max_seconds is None or config.duration_max_seconds < config.duration_min_seconds:
+            raise ValueError(f"{resolved_path} 的 pre_skill.duration_seconds.max 不能小于 min")
+        if config.average_interval_seconds is None or config.average_interval_seconds <= 0.0:
+            raise ValueError(f"{resolved_path} 的 pre_skill.duration_seconds.average_interval 必须大于 0")
+    if config.samples_per_speed_heading < 1:
+        raise ValueError(f"{resolved_path} 的 pre_skill.samples_per_speed_heading 不能小于 1")
     if config.approach_direction_window_frames < 1:
         raise ValueError(f"{resolved_path} 的 pre_skill.approach_direction_window_frames 不能小于 1")
     return config
+
+
+def _build_pre_skill_schedule(config: PreSkillConfig, num_trajectories: int) -> list[PreSkillSample]:
+    """构造覆盖全部速度/转角的确定性分层采样表。"""
+    if num_trajectories < 0:
+        raise ValueError("轨迹数量不能小于 0")
+    if num_trajectories == 0:
+        return []
+
+    num_speeds = len(config.speed_levels_mps)
+    num_headings = len(config.heading_degrees)
+    expected_count = num_speeds * num_headings * config.samples_per_speed_heading
+    if config.duration_min_seconds is not None and num_trajectories != expected_count:
+        raise ValueError(
+            "启用 pre_skill.duration_seconds 后，轨迹数必须等于 "
+            f"{num_speeds} speeds × {num_headings} headings × "
+            f"{config.samples_per_speed_heading} repetitions = {expected_count}，"
+            f"当前为 {num_trajectories}。"
+        )
+
+    if config.duration_min_seconds is None:
+        return [
+            PreSkillSample(
+                speed_mps=float(config.speed_levels_mps[index % num_speeds]),
+                heading_degrees=float(config.heading_degrees[(index // num_speeds) % num_headings]),
+                duration_seconds=None,
+                schedule_index=index,
+            )
+            for index in range(num_trajectories)
+        ]
+
+    samples_per_speed = num_headings * config.samples_per_speed_heading
+    durations = np.linspace(
+        config.duration_min_seconds,
+        config.duration_max_seconds,
+        samples_per_speed,
+        dtype=np.float64,
+    )
+    if len(durations) > 1:
+        actual_interval = float(np.mean(np.diff(durations)))
+        tolerance = max(0.05, 0.2 * float(config.average_interval_seconds))
+        if abs(actual_interval - float(config.average_interval_seconds)) > tolerance:
+            raise ValueError(
+                "分层采样的平均时间间隔与配置不符："
+                f"actual={actual_interval:.3f}s, requested={config.average_interval_seconds:.3f}s"
+            )
+
+    schedule: list[PreSkillSample] = []
+    for speed_index, speed_mps in enumerate(config.speed_levels_mps):
+        # 每个转角重复相同次数；奇数 repetition 反向排列，降低时间与转角的固定相关性。
+        headings: list[float] = []
+        for repetition in range(config.samples_per_speed_heading):
+            values = config.heading_degrees if repetition % 2 == 0 else tuple(reversed(config.heading_degrees))
+            headings.extend(float(value) for value in values)
+        for within_speed_index, (heading_degrees, duration_seconds) in enumerate(zip(headings, durations)):
+            schedule.append(
+                PreSkillSample(
+                    speed_mps=float(speed_mps),
+                    heading_degrees=heading_degrees,
+                    duration_seconds=float(duration_seconds),
+                    schedule_index=speed_index * samples_per_speed + within_speed_index,
+                )
+            )
+    return schedule
 
 
 def _load_terrain_anchor_config(config_path: Path) -> TerrainAnchorConfig:
@@ -320,7 +418,18 @@ def _select_candidate_index(
         if available_future_frames >= minimum_future_frames:
             return int(database_index)
 
-    return int(ranked_indices[0])
+    maximum_available_future_frames = max(
+        clips[int(database.clip_indices[int(database_index)])].num_frames
+        - int(database.frame_indices[int(database_index)])
+        - 1
+        for database_index in ranked_indices
+    )
+    raise RuntimeError(
+        "没有满足完整续接长度的 motion-matching 候选："
+        f"required_future_frames={minimum_future_frames}, "
+        f"maximum_available_future_frames={maximum_available_future_frames}, "
+        f"candidate_count={len(ranked_indices)}"
+    )
 
 
 def _select_locomotion_approach_index(
@@ -330,6 +439,7 @@ def _select_locomotion_approach_index(
     database: DatabaseBundle,
     clips: list[MotionClip],
     minimum_future_frames: int,
+    current_root_yaw: float | None = None,
 ) -> int:
     candidate_indices = database.locomotion_database_indices
     if len(candidate_indices) == 0:
@@ -400,11 +510,30 @@ def _select_locomotion_approach_index(
         clip_index = int(database.clip_indices[int(database_index)])
         frame_index = int(database.frame_indices[int(database_index)])
         clip = clips[clip_index]
+        candidate_yaw = quaternion_to_yaw(
+            clip.qpos[frame_index, :4]
+        )
+        if current_root_yaw is not None:
+            yaw_error = np.arctan2(
+                np.sin(candidate_yaw - current_root_yaw),
+                np.cos(candidate_yaw - current_root_yaw),
+            )
         available_future_frames = clip.num_frames - frame_index - 1
         if available_future_frames >= minimum_future_frames:
             return int(database_index)
 
-    return int(ranked_indices[0])
+    maximum_available_future_frames = max(
+        clips[int(database.clip_indices[int(database_index)])].num_frames
+        - int(database.frame_indices[int(database_index)])
+        - 1
+        for database_index in ranked_indices
+    )
+    raise RuntimeError(
+        "没有满足完整 approach 续接长度的 motion-matching 候选："
+        f"required_future_frames={minimum_future_frames}, "
+        f"maximum_available_future_frames={maximum_available_future_frames}, "
+        f"candidate_count={len(ranked_indices)}"
+    )
 
 
 def _smoothstep(value: float) -> float:
@@ -635,14 +764,37 @@ def _append_clip_chunk(
 
     previous_qpos = output_qpos[-1] if output_qpos else None
     pre_previous_qpos = output_qpos[-2] if len(output_qpos) >= 2 else None
+    source_start_frame = int(source_start_frame)
+    if source_start_frame < 0 or source_start_frame >= clip.num_frames:
+        raise RuntimeError(
+            f"source_start_frame 越界：clip={clip.name}, "
+            f"source_start_frame={source_start_frame}, num_frames={clip.num_frames}"
+        )
     if previous_qpos is None:
+        available_source_frames = clip.num_frames - source_start_frame
+        if available_source_frames < desired_new_frames:
+            raise RuntimeError(
+                "首次追加的 source chunk 不完整："
+                f"clip={clip.name}, required={desired_new_frames}, "
+                f"available={available_source_frames}, source_start_frame={source_start_frame}"
+            )
         source_end_frame = min(clip.num_frames, source_start_frame + desired_new_frames)
         source_segment = clip.qpos[source_start_frame:source_end_frame]
         appended = compose_transition(source_segment, None, dt, inertialization_damping)
     else:
+        available_future_frames = clip.num_frames - source_start_frame - 1
+        if available_future_frames < desired_new_frames:
+            raise RuntimeError(
+                "source chunk 不包含请求的完整未来帧："
+                f"clip={clip.name}, required={desired_new_frames}, "
+                f"available={available_future_frames}, source_start_frame={source_start_frame}"
+            )
         source_end_frame = min(clip.num_frames, source_start_frame + desired_new_frames + 1)
         if source_end_frame - source_start_frame < 2:
-            return np.zeros((0, clip.qpos.shape[1]), dtype=np.float64)
+            raise RuntimeError(
+                f"source chunk 太短，无法追加：clip={clip.name}, "
+                f"source_start_frame={source_start_frame}, desired_new_frames={desired_new_frames}"
+            )
         source_segment = clip.qpos[source_start_frame:source_end_frame]
         if align_to_previous_root:
             transitioned = compose_transition(source_segment, previous_qpos, dt, inertialization_damping)
@@ -961,6 +1113,7 @@ def _generate_single_trajectory(
     clips: list[MotionClip],
     skill_metadata: dict[str, Any],
     rng: np.random.Generator,
+    pre_skill_sample: PreSkillSample,
     pre_skill_config: PreSkillConfig,
     terrain_anchor_config: TerrainAnchorConfig,
     start_pose_config: StartPoseConfig,
@@ -970,22 +1123,26 @@ def _generate_single_trajectory(
     post_skill_frames: int,
     kinematics: KinematicsHelper,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    speed_mps = float(rng.choice(np.asarray(pre_skill_config.speed_levels_mps, dtype=np.float64)))
+    speed_mps = float(pre_skill_sample.speed_mps)
     initial_heading_delta_deg = float(
         np.clip(
-            rng.choice(np.asarray(pre_skill_config.heading_degrees, dtype=np.float64)),
+            pre_skill_sample.heading_degrees,
             -MAX_INITIAL_HEADING_DELTA_DEGREES,
             MAX_INITIAL_HEADING_DELTA_DEGREES,
         )
     )
-    pre_skill_distance_meters = float(
-        rng.uniform(
-            pre_skill_config.start_distance_min_meters,
-            pre_skill_config.start_distance_max_meters,
+    if pre_skill_sample.duration_seconds is None:
+        pre_skill_distance_meters = float(
+            rng.uniform(
+                pre_skill_config.start_distance_min_meters,
+                pre_skill_config.start_distance_max_meters,
+            )
         )
-    )
-    pre_skill_seconds = pre_skill_distance_meters / max(speed_mps, 1e-6)
-    pre_skill_frames = max(search_interval_frames, int(round(pre_skill_seconds * clips[0].fps)))
+        pre_skill_seconds = pre_skill_distance_meters / max(speed_mps, 1e-6)
+    else:
+        pre_skill_seconds = float(pre_skill_sample.duration_seconds)
+        pre_skill_distance_meters = speed_mps * pre_skill_seconds
+    pre_skill_frames = max(1, int(round(pre_skill_seconds * clips[0].fps)))
 
     approach_command = np.asarray([speed_mps, 0.0], dtype=np.float64)
     skill_command = np.asarray([speed_mps, 0.0], dtype=np.float64)
@@ -1057,8 +1214,86 @@ def _generate_single_trajectory(
     steering_clip_name = steering_clip.name
     steering_source_frame = int(database.frame_indices[initial_skill_index])
 
+
+    initial_query = _build_query_from_steering_plan(
+        output_qpos=output_qpos,
+        kinematics=kinematics,
+        dt=dt,
+        command_local_velocity_xy=approach_command,
+        database=database,
+    )
+
+    final_skill_database_index = (
+        _select_skill_entry_index(
+            query_feature=initial_query,
+            skill_metadata=skill_metadata,
+            database=database,
+            clips=clips,
+        )
+    )
+
+    target_clip = clips[
+        int(
+            database.clip_indices[
+                final_skill_database_index
+            ]
+        )
+        ]
+
+    target_frame = int(
+        database.frame_indices[
+            final_skill_database_index
+        ]
+    )
     while (len(output_qpos) - 1) < pre_skill_frames:
-        remaining_frames = pre_skill_frames - (len(output_qpos) - 1)
+        remaining_frames = (pre_skill_frames - (len(output_qpos) - 1))
+        if remaining_frames <= (2 * search_interval_frames):
+            desired_frames = min(4, remaining_frames)
+        else:
+            desired_frames = min(search_interval_frames, remaining_frames)
+
+        current_qpos = output_qpos[-1]
+        current_pos = np.asarray(
+            current_qpos[4:7],
+            dtype=np.float64,
+        )
+        current_yaw = quaternion_to_yaw(current_qpos[:4])
+
+        target_pos = np.asarray(
+            target_clip.qpos[
+                target_frame,
+                4:7,
+            ],
+            dtype=np.float64,
+        )
+
+        target_direction_world = (target_pos - current_pos)
+        remaining_distance = np.linalg.norm(target_direction_world[:2])
+
+        target_direction_local = (
+            world_to_local_vector(
+                target_direction_world,
+                current_yaw,
+            )[:2]
+        )
+
+        direction_norm = np.linalg.norm(target_direction_local)
+        desired_speed = (remaining_distance / max(remaining_frames * dt, 1e-6))
+        desired_speed = np.clip(
+            desired_speed,
+            0.6 * speed_mps,
+            1.35 * speed_mps,
+        )
+
+        if direction_norm > 1e-6:
+
+            target_command = (target_direction_local / direction_norm) * desired_speed
+            approach_command = (0.90 * approach_command + 0.10 * target_command)
+        else:
+            approach_command = np.asarray(
+                [desired_speed, 0.0],
+                dtype=np.float64,
+            )
         query_feature = _build_query_from_steering_plan(
             output_qpos=output_qpos,
             kinematics=kinematics,
@@ -1071,21 +1306,28 @@ def _generate_single_trajectory(
             command_local_velocity_xy=approach_command,
             database=database,
             clips=clips,
-            minimum_future_frames=1,
+            minimum_future_frames=desired_frames,
+            current_root_yaw=current_yaw,
         )
-        clip = clips[int(database.clip_indices[database_index])]
-        frame_index = int(database.frame_indices[database_index])
+        clip = clips[
+            int(database.clip_indices[database_index])
+        ]
+        frame_index = int(
+            database.frame_indices[database_index]
+        )
         output_start = len(output_qpos)
+
         appended = _append_clip_chunk(
             output_qpos=output_qpos,
             clip=clip,
             source_start_frame=frame_index,
-            desired_new_frames=min(search_interval_frames, remaining_frames),
+            desired_new_frames=desired_frames,
             dt=dt,
             inertialization_damping=inertialization_damping,
         )
         if len(appended) == 0:
             break
+
         segments.append(
             _segment_record(
                 mode="locomotion_approach",
@@ -1152,6 +1394,7 @@ def _generate_single_trajectory(
     target_total_frames = len(output_qpos) + post_skill_frames
     while len(output_qpos) < target_total_frames:
         remaining_frames = target_total_frames - len(output_qpos)
+        desired_frames = min(search_interval_frames, remaining_frames)
         query_feature = _build_query_from_output(
             output_qpos=output_qpos,
             kinematics=kinematics,
@@ -1165,7 +1408,7 @@ def _generate_single_trajectory(
             candidate_indices=database.locomotion_database_indices,
             database=database,
             clips=clips,
-            minimum_future_frames=1,
+            minimum_future_frames=desired_frames,
         )
         clip = clips[int(database.clip_indices[database_index])]
         frame_index = int(database.frame_indices[database_index])
@@ -1174,12 +1417,10 @@ def _generate_single_trajectory(
             output_qpos=output_qpos,
             clip=clip,
             source_start_frame=frame_index,
-            desired_new_frames=min(search_interval_frames, remaining_frames),
+            desired_new_frames=desired_frames,
             dt=dt,
             inertialization_damping=inertialization_damping,
         )
-        if len(appended) == 0:
-            break
         segments.append(
             _segment_record(
                 mode="locomotion_recovery",
@@ -1228,6 +1469,7 @@ def _generate_single_trajectory(
             "anchor_policy": "matched_entry_frame_to_transition_root",
         },
         "command": {
+            "sampling_schedule_index": int(pre_skill_sample.schedule_index),
             "speed_mps": speed_mps,
             "initial_heading_reference_deg": initial_heading_reference_deg,
             "initial_heading_delta_deg": initial_heading_delta_deg,
@@ -1241,6 +1483,7 @@ def _generate_single_trajectory(
             "pre_skill_distance_meters": pre_skill_distance_meters,
             "min_start_distance_meters": MIN_START_DISTANCE_METERS,
             "pre_skill_seconds": pre_skill_seconds,
+            "effective_pre_skill_seconds": pre_skill_frames / float(fps),
             "pre_skill_frames": pre_skill_frames,
             "post_skill_frames": post_skill_frames,
         },
@@ -1399,6 +1642,7 @@ def main() -> None:
 
         skill_seed = args.seed + skill_offset + generation_start_index * 1_000_003
         rng = np.random.default_rng(skill_seed)
+        pre_skill_schedule = _build_pre_skill_schedule(pre_skill_config, requested_total)
         trajectory_manifests: list[dict[str, Any]] = []
         if args.append_existing and generation_start_index > 0:
             trajectory_manifests = _load_existing_trajectory_manifests(
@@ -1421,6 +1665,7 @@ def main() -> None:
                         clips=clips,
                         skill_metadata=skill_metadata,
                         rng=rng,
+                        pre_skill_sample=pre_skill_schedule[trajectory_index],
                         pre_skill_config=pre_skill_config,
                         terrain_anchor_config=terrain_anchor_config,
                         start_pose_config=start_pose_config,
@@ -1475,6 +1720,16 @@ def main() -> None:
                     "min": float(pre_skill_config.start_distance_min_meters),
                     "max": float(pre_skill_config.start_distance_max_meters),
                 },
+                "duration_seconds": (
+                    None
+                    if pre_skill_config.duration_min_seconds is None
+                    else {
+                        "min": float(pre_skill_config.duration_min_seconds),
+                        "max": float(pre_skill_config.duration_max_seconds),
+                        "average_interval": float(pre_skill_config.average_interval_seconds),
+                    }
+                ),
+                "samples_per_speed_heading": int(pre_skill_config.samples_per_speed_heading),
                 "approach_direction_window_frames": int(pre_skill_config.approach_direction_window_frames),
             },
             "terrain_asset_reference_config": {
